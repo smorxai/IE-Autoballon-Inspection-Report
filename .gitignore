@@ -145,8 +145,7 @@ backend/Logs/
 **/__pycache__/
 *.py[cod]
 
-# Secrets / local config
-backend/default_config.json
+# Secrets / local config (use env vars; default_config.json in repo is scrubbed template)
 .env
 *.sqlite
 
