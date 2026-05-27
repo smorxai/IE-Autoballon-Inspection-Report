@@ -120,6 +120,32 @@ def get_yolo_weights_path_loaded() -> Optional[str]:
     return _YOLO_WEIGHTS_PATH
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def yolo_web_class_conf_thresholds() -> dict[str, float]:
+    """Per-class minimum confidence after YOLO NMS (lower = more detections)."""
+    return {
+        "Dimensions": _env_float("BALLOON_YOLO_CONF_DIMENSIONS", 0.07),
+        "GDnT": _env_float("BALLOON_YOLO_CONF_GDNT", 0.08),
+        "Notes": _env_float("BALLOON_YOLO_CONF_NOTES", 0.12),
+        "Special_Characteristics": _env_float("BALLOON_YOLO_CONF_SC", 0.10),
+        "Surface_Finish_Symbols": _env_float("BALLOON_YOLO_CONF_SF", 0.12),
+        "Title_Block": _env_float("BALLOON_YOLO_CONF_TITLE", 0.10),
+        "Revision_Table": _env_float("BALLOON_YOLO_CONF_REVISION", 0.10),
+        "Datums": _env_float("BALLOON_YOLO_CONF_DATUMS", 0.08),
+        "Welding_Symbols": _env_float("BALLOON_YOLO_CONF_WELD", 0.10),
+        "Miscellaneous": _env_float("BALLOON_YOLO_CONF_MISC", 0.10),
+    }
+
+
 def yolo_autoballoon_inference_params(long_side: int, is_pdf_input: bool) -> Tuple[int, float]:
     """
     YOLO imgsz / confidence for engineering drawings.
@@ -127,15 +153,17 @@ def yolo_autoballoon_inference_params(long_side: int, is_pdf_input: bool) -> Tup
     Large raster exports (e.g. 10k+ px from PDF) need a much larger imgsz than the
     old default (1024). ProcessMultipleViews used imgsz=1024 only, so detection was
     effectively blind on huge PNGs.
+
+    Override base conf: BALLOON_YOLO_CONF (e.g. 0.03). PDF default is higher than raster.
     """
     if is_pdf_input:
-        infer_conf = 0.20
+        infer_conf = _env_float("BALLOON_YOLO_CONF_PDF", _env_float("BALLOON_YOLO_CONF", 0.20))
         infer_imgsz = 1024
         if long_side > 4000:
             infer_imgsz = min(2560, max(1280, long_side // 6))
         return infer_imgsz, infer_conf
 
-    infer_conf = 0.08
+    infer_conf = _env_float("BALLOON_YOLO_CONF", 0.06)
     infer_imgsz = 1024
     if long_side > 8000:
         infer_imgsz = min(3200, max(2560, long_side // 4))
@@ -157,8 +185,23 @@ YOLO_TARGET_CLASSES_FOR_CROPS = (
 )
 
 
-DIMENSION_EXTRACTION_PROMPT = """
-# Technical Drawing Dimension & Notes Extraction
+def _dimension_extraction_prompt_template() -> str:
+    try:
+        from Resources.prompts.mechanical_ballooning import (
+            BALLOONING_RULES,
+            EXTRACTION_CATEGORIES,
+            MECHANICAL_ENGINEER_ROLE,
+        )
+
+        header = MECHANICAL_ENGINEER_ROLE + "\n" + EXTRACTION_CATEGORIES + "\n" + BALLOONING_RULES + "\n"
+    except Exception:
+        header = (
+            "You are an expert Mechanical Design Engineer, GD&T Engineer, and Quality "
+            "Inspection Specialist. Extract ALL dimensions, tolerances, GD&T, holes, notes, "
+            "and metadata without omission.\n"
+        )
+    return header + """
+# Technical Drawing Dimension & Notes Extraction (structured JSON output)
 
 You are an expert at extracting dimensional info, GD&T symbols, and notes from engineering drawings and structuring them in a detailed format.
 
@@ -522,6 +565,9 @@ REMEMBER:
 
 ONLY output valid JSON. No extra text.
 """
+
+
+DIMENSION_EXTRACTION_PROMPT = _dimension_extraction_prompt_template()
 
 
 TITLE_BLOCK_EXTRACTION = """
@@ -1210,7 +1256,8 @@ def detectViews(imagePath: str, outputDir: str):
 
 
 def RunInference(weights, image_path, imgsz=1024, conf_thres=0.5, iou_thres=0.45, 
-                 device='cpu', CustomNms_threshold=0.6, bbox_padding=40, class_conf_thres=None):
+                 device='cpu', CustomNms_threshold=0.6, bbox_padding=40, class_conf_thres=None,
+                 apply_legacy_merges=True):
     
     # `weights` kept for call-site compatibility; global model path is resolve_autoballoon_weights_path().
     model = get_yolo_model()
@@ -1280,11 +1327,12 @@ def RunInference(weights, image_path, imgsz=1024, conf_thres=0.5, iou_thres=0.45
     Logger.debug(f"Total detections before custom NMS: {len(detections)}")
     
     detections = CustomNms(detections, CustomNms_threshold)
-   
-    detections = mergeSC(detections)
-    detections = mergeNotes(detections)
-    
-    Logger.debug(f"Total detections after custom NMS: {len(detections)}")
+
+    if apply_legacy_merges:
+        detections = mergeSC(detections)
+        detections = mergeNotes(detections)
+
+    Logger.debug(f"Total detections after post-process: {len(detections)}")
     return detections
 
 
@@ -2578,7 +2626,18 @@ def run_drawing_yolo_detection(
         h, w = img.shape[:2]
         long_side = max(w, h)
         infer_imgsz, infer_conf = yolo_autoballoon_inference_params(long_side, is_pdf)
-        preds = RunInference(None, infer_path, imgsz=infer_imgsz, conf_thres=infer_conf)
+        pad = max(5, min(18, int(long_side * 0.003)))
+        web_class_conf = yolo_web_class_conf_thresholds()
+        preds = RunInference(
+            None,
+            infer_path,
+            imgsz=infer_imgsz,
+            conf_thres=infer_conf,
+            CustomNms_threshold=0.82,
+            bbox_padding=pad,
+            class_conf_thres=web_class_conf,
+            apply_legacy_merges=False,
+        )
 
         out = []
         for d in preds:
@@ -2643,6 +2702,7 @@ def run_drawing_yolo_detection(
                 "infer_image_path": infer_path,
                 "input_kind": kind,
                 "preview_image_base64": preview_b64,
+                "yolo_raw_count": len(out),
             },
             None,
         )

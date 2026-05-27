@@ -20,6 +20,7 @@ certifi
 numpy
 pandas
 pillow
+pytesseract
 matplotlib
 opencv-python
 PyMuPDF

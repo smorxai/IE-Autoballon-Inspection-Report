@@ -4,19 +4,45 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
-  <title>Auto Ballooning Software</title>
-  <link rel="stylesheet" href="/assets/style.css?v=23" />
+  <title>Inspection Report Software</title>
+  <link rel="stylesheet" href="/assets/style.css?v=28" />
 </head>
-<body>
+<body class="auth-pending">
+  <style>
+    body.auth-pending { visibility: hidden; }
+    body.auth-pending::before {
+      content: "Checking login…";
+      visibility: visible;
+      display: block;
+      text-align: center;
+      padding: 3rem;
+      color: #8b9cb3;
+    }
+  </style>
+  <script src="/assets/auth.js?v=4"></script>
+  <script>
+  (function () {
+    if (!window.BalloonAuth) {
+      document.body.classList.remove("auth-pending");
+      return;
+    }
+    BalloonAuth.requireAppAccess().then(function (ctx) {
+      if (ctx) document.body.classList.remove("auth-pending");
+    }).catch(function () {
+      window.location.replace("/login");
+    });
+  })();
+  </script>
   <header class="top">
     <div class="top-left">
       <a class="brand" href="/" aria-label="SmorX.ai home">
-        <img class="brand-logo" src="/assets/smorx-logo.jpg" alt="SmorX.ai" width="180" height="48" />
+        <img class="brand-logo brand-logo--full" src="/assets/smorx-logo-full.png?v=1" alt="SmorX.ai" width="400" height="164" />
       </a>
     </div>
-    <h1 class="top-title">Auto Ballooning Software</h1>
+    <h1 class="top-title">Inspection Software system</h1>
     <div class="top-right top-actions">
       <a id="adminLink" class="btn-secondary" href="/admin" style="display:none">Admin</a>
+      <button type="button" id="logoutBtn" class="btn-secondary" style="display:none">Log out</button>
       <button type="button" id="inspectionReport" class="btn-inspection" disabled>Inspection report</button>
       <button type="button" id="dashboardBtn" class="btn-secondary">Go to Dashboard</button>
     </div>
@@ -47,6 +73,7 @@
           <button type="button" id="btnModeCreate" class="btn-secondary mode-btn" disabled title="Draw a rectangle on the drawing to add a manual detection and balloon">Create</button>
           <button type="button" id="btnModeEdit" class="btn-secondary mode-btn" disabled title="Drag balloon circles to reposition">Edit</button>
           <button type="button" id="btnModeDelete" class="btn-secondary mode-btn mode-delete" disabled title="Click a balloon circle to remove it (then Save)">Delete</button>
+          <button type="button" id="btnUndoDelete" class="btn-secondary mode-btn btn-undo-delete" hidden title="Restore deleted balloons (newest first; multiple undo steps)">Undo delete</button>
           <button type="button" id="btnModeSave" class="btn-secondary mode-btn mode-save" disabled title="Save balloon positions and manual regions to JSON and table">Save</button>
           <div class="balloon-menu-wrap">
             <button type="button" id="btnBalloonMenu" class="btn-secondary btn-icon" disabled title="Quick table — edit balloons, then save to sync below" aria-expanded="false" aria-controls="balloonQuickPanel">⋮</button>
@@ -55,7 +82,7 @@
                 <strong>Quick edit</strong>
                 <button type="button" id="btnCloseQuickPanel" class="btn-close-quick" aria-label="Close">×</button>
               </div>
-              <p class="balloon-quick-hint">Drag the title bar to move. Edit rows, then <strong>Save to main table</strong> — values sync to Detected details below.</p>
+              <p class="balloon-quick-hint">Drag the title bar to move. Edit rows, then <strong>Save to main table</strong> — values sync to Details below.</p>
               <div class="balloon-quick-table-wrap">
                 <table class="quick-balloon-table" id="quickBalloonTable">
                   <thead>
@@ -81,11 +108,12 @@
         </div>
       </div>
       <div id="panelBalloon" class="panel"><p class="placeholder">Run auto ballooning to see balloons here.</p></div>
+      <div id="detectionLegend" class="detection-legend" hidden aria-label="Detection class colors"></div>
     </section>
   </div>
 
   <section class="results-block">
-    <h2>Detected details</h2>
+    <h2>Details</h2>
     <div class="table-wrap">
       <table id="resultTable">
         <thead>
@@ -98,7 +126,7 @@
           </tr>
         </thead>
         <tbody id="resultBody">
-          <tr><td colspan="5">Run auto ballooning to see extracted values.</td></tr>
+          <tr><td colspan="5">Run the application to see extracted values.</td></tr>
         </tbody>
       </table>
     </div>
@@ -119,6 +147,9 @@
     </div>
   </div>
 
-  <script src="/assets/app.js?v=28"></script>
+  <script src="/assets/auth.js?v=4"></script>
+  <script src="/assets/inspection_store.js?v=6"></script>
+  <script src="/assets/balloon_parse.js?v=42"></script>
+  <script src="/assets/app.js?v=91"></script>
 </body>
 </html>

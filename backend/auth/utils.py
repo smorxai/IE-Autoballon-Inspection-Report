@@ -131,6 +131,71 @@ def decode_access_token(token: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 # Email delivery via Resend
 # ---------------------------------------------------------------------------
+def generate_otp(length: int = 6) -> str:
+    """Return a numeric OTP code."""
+    return "".join(str(secrets.randbelow(10)) for _ in range(length))
+
+
+def send_otp_email(to_email: str, name: str, otp: str, purpose: str = "signup") -> tuple[bool, str]:
+    """
+    Send OTP via Resend. Returns (email_sent, error_message).
+    When Resend is not configured, email_sent is False (caller may show dev_otp).
+    """
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    subject = "Your SmorX.ai verification code"
+    if purpose == "signup":
+        body_html = (
+            f"<h3>Verify your email</h3>"
+            f"<p>Hi {name or 'there'},</p>"
+            f"<p>Your verification code is:</p>"
+            f"<h2 style='letter-spacing:4px'>{otp}</h2>"
+            f"<p>This code expires in 10 minutes.</p>"
+        )
+    else:
+        body_html = (
+            f"<h3>Verification code</h3>"
+            f"<p>Your code is: <strong>{otp}</strong></p>"
+            f"<p>Expires in 10 minutes.</p>"
+        )
+
+    if not api_key:
+        print(
+            f"\n[OTP — CONSOLE FALLBACK]\n"
+            f"  To      : {to_email}\n"
+            f"  Purpose : {purpose}\n"
+            f"  OTP     : {otp}\n"
+            f"  (Set RESEND_API_KEY in backend/.env for real email delivery)\n"
+        )
+        return False, "Email not configured on server."
+
+    try:
+        import resend as resend_sdk
+        resend_sdk.api_key = api_key
+        from_email = os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev")
+        resend_sdk.Emails.send({
+            "from": f"SmorX.ai <{from_email}>",
+            "to": [to_email],
+            "subject": subject,
+            "html": body_html,
+        })
+        return True, ""
+    except Exception as exc:
+        print(f"[OTP EMAIL ERROR] {exc}")
+        print(f"[OTP FALLBACK] {to_email} → {otp}")
+        return False, str(exc)
+
+
+def find_user_by_login(db, login: str):
+    """Find user by email or username."""
+    from auth.models import User
+
+    key = login.strip().lower()
+    user = db.query(User).filter(User.email == key).first()
+    if user:
+        return user
+    return db.query(User).filter(User.username == key).first()
+
+
 def send_temp_password_email(
     to_email: str,
     name: str,

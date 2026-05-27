@@ -74,7 +74,6 @@ body {
   flex-shrink: 0;
 }
 .top .brand-logo,
-.login-brand img,
 .ir-brand img {
   display: block;
   height: auto;
@@ -84,6 +83,7 @@ body {
   object-fit: contain;
   object-position: left center;
 }
+/* Login logo sizing is in auth.css — do not cap width here */
 .top-title {
   margin: 0;
   padding: 0 1rem;

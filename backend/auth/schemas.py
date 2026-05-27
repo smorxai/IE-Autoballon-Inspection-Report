@@ -14,13 +14,71 @@ from pydantic import BaseModel, EmailStr, field_validator
 # Auth — request bodies
 # ---------------------------------------------------------------------------
 class LoginRequest(BaseModel):
-    email: str
+    login: str  # email or username
     password: str
+
+    @field_validator("login")
+    @classmethod
+    def normalise_login(cls, v: str) -> str:
+        return v.strip().lower()
+
+
+class SendOtpRequest(BaseModel):
+    email: str
+    name: str = ""
+    purpose: str = "signup"
+    organization_name: str = ""
 
     @field_validator("email")
     @classmethod
     def normalise_email(cls, v: str) -> str:
         return v.strip().lower()
+
+    @field_validator("organization_name")
+    @classmethod
+    def strip_org(cls, v: str) -> str:
+        return v.strip()
+
+
+class RegisterRequest(BaseModel):
+    name: str
+    username: str
+    email: str
+    password: str
+    confirm_password: str
+    otp: str
+    organization_name: str
+
+    @field_validator("email")
+    @classmethod
+    def normalise_email(cls, v: str) -> str:
+        return v.strip().lower()
+
+    @field_validator("username")
+    @classmethod
+    def normalise_username(cls, v: str) -> str:
+        u = v.strip().lower()
+        if len(u) < 3:
+            raise ValueError("Username must be at least 3 characters.")
+        if not all(c.isalnum() or c in "._-" for c in u):
+            raise ValueError("Username may only contain letters, numbers, . _ -")
+        return u
+
+    @field_validator("password")
+    @classmethod
+    def validate_strength(cls, v: str) -> str:
+        from auth.utils import validate_password_strength
+        err = validate_password_strength(v)
+        if err:
+            raise ValueError(err)
+        return v
+
+    @field_validator("organization_name")
+    @classmethod
+    def not_empty_org(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Organization name is required.")
+        return v.strip()
 
 
 class ChangePasswordRequest(BaseModel):
@@ -63,12 +121,25 @@ class UserResponse(BaseModel):
     id: UUID
     name: str
     email: str
+    username: Optional[str] = None
     role: str
     tenant_id: Optional[str]
     is_temp_password: bool
+    email_verified: bool = False
+    can_read: bool = True
+    can_write: bool = True
+    can_delete: bool = True
+    is_active: bool = True
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class UpdateUserPermissionsRequest(BaseModel):
+    can_read: bool
+    can_write: bool
+    can_delete: bool
+    is_active: bool
 
 
 # ---------------------------------------------------------------------------

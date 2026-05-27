@@ -21,7 +21,7 @@ from sqlalchemy import (
     Text,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from auth.db_types import JSONB, UUIDStr
 from sqlalchemy.orm import relationship
 
 from auth.database import Base
@@ -41,7 +41,7 @@ class RoleEnum(str, enum.Enum):
 class Organization(Base):
     __tablename__ = "organizations"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(UUIDStr(), primary_key=True, default=uuid.uuid4)
     name = Column(String(255), nullable=False)
     # tenant_id is the stable public identifier used in every query for isolation.
     # Generated as a short UUID slug on creation.
@@ -70,17 +70,27 @@ class Organization(Base):
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(UUIDStr(), primary_key=True, default=uuid.uuid4)
     name = Column(String(255), nullable=False)
     email = Column(String(255), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)
-    role = Column(Enum(RoleEnum), nullable=False, default=RoleEnum.engineer)
+    role = Column(Enum(RoleEnum, native_enum=False), nullable=False, default=RoleEnum.engineer)
 
     # tenant_id is NULL for super_admin; references organizations.tenant_id for engineers
     tenant_id = Column(String(64), ForeignKey("organizations.tenant_id"), nullable=True, index=True)
 
     # Temporary password flag — engineers must change on first login
     is_temp_password = Column(Boolean, nullable=False, default=True)
+    email_verified = Column(Boolean, nullable=False, default=False)
+
+    # Login username (unique); signup sets this explicitly
+    username = Column(String(64), unique=True, nullable=True, index=True)
+
+    # Super admin can toggle per user
+    can_read = Column(Boolean, nullable=False, default=True)
+    can_write = Column(Boolean, nullable=False, default=True)
+    can_delete = Column(Boolean, nullable=False, default=True)
+    is_active = Column(Boolean, nullable=False, default=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -95,12 +105,12 @@ class User(Base):
 class Activity(Base):
     __tablename__ = "activities"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(UUIDStr(), primary_key=True, default=uuid.uuid4)
 
     # Always set — super_admin actions are stored under "system" tenant
     tenant_id = Column(String(64), ForeignKey("organizations.tenant_id"), nullable=False, index=True)
 
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    user_id = Column(UUIDStr(), ForeignKey("users.id"), nullable=False, index=True)
 
     # Human-readable action label e.g. "drawing_upload", "excel_export"
     action_type = Column(String(100), nullable=False)
@@ -122,11 +132,11 @@ class Activity(Base):
 class DrawingSession(Base):
     __tablename__ = "drawing_sessions"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(UUIDStr(), primary_key=True, default=uuid.uuid4)
 
     # Tenant isolation — always required
     tenant_id = Column(String(64), ForeignKey("organizations.tenant_id"), nullable=False, index=True)
-    user_id   = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    user_id   = Column(UUIDStr(), ForeignKey("users.id"), nullable=False, index=True)
 
     # Human-readable file name from the original upload
     filename  = Column(String(500), nullable=False, default="drawing")
@@ -147,3 +157,18 @@ class DrawingSession(Base):
     # Relationships
     organization = relationship("Organization", foreign_keys=[tenant_id])
     user         = relationship("User",         foreign_keys=[user_id])
+
+
+# ---------------------------------------------------------------------------
+# Email OTP — signup / verification
+# ---------------------------------------------------------------------------
+class EmailOtp(Base):
+    __tablename__ = "email_otps"
+
+    id = Column(UUIDStr(), primary_key=True, default=uuid.uuid4)
+    email = Column(String(255), nullable=False, index=True)
+    otp_hash = Column(String(255), nullable=False)
+    purpose = Column(String(32), nullable=False, default="signup")
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    verified = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

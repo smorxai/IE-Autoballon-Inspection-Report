@@ -3,27 +3,35 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Login — Auto Ballooning &amp; inspection report Software System</title>
+  <title>Login — Inspection Report</title>
   <link rel="stylesheet" href="/assets/style.css?v=10" />
-  <link rel="stylesheet" href="/assets/auth.css?v=3" />
+  <link rel="stylesheet" href="/assets/auth.css?v=11" />
 </head>
 <body class="auth-body">
-  <div class="auth-card">
+  <div class="auth-card auth-card-login" id="card">
     <div class="login-brand">
-      <img src="/assets/smorx-logo.png" alt="SmorX.ai" />
-      <h1>Auto Ballooning &amp; inspection report Software System</h1>
+      <img class="brand-logo brand-logo--full" src="/assets/smorx-logo-full.png?v=1" alt="SmorX.ai" width="400" height="164" />
+      <h1>Inspection Report</h1>
     </div>
+
     <div id="msg" class="auth-msg"></div>
-    <label>Login through email</label>
-    <input type="email" id="email" autocomplete="username" placeholder="you@gmail.com" />
-    <label>Password</label>
-    <input type="password" id="password" autocomplete="current-password" placeholder="••••••••" />
-    <div class="auth-actions">
-      <button type="button" id="btnLogin" class="primary">Login</button>
-      <button type="button" id="btnRegister" class="btn-secondary">Create account</button>
+
+    <div id="panelLogin">
+      <p class="auth-hint">Sign in with the email and password provided by your administrator.</p>
+
+      <label for="loginId">Email or username</label>
+      <input type="text" id="loginId" autocomplete="username" placeholder="you@company.com or username" />
+
+      <label for="password">Password</label>
+      <input type="password" id="password" autocomplete="current-password" placeholder="••••••••" />
+
+      <div class="auth-actions">
+        <button type="button" id="btnLogin" class="primary">Log in</button>
+      </div>
+      <p class="auth-small">Accounts are created by your super admin. Contact them if you need access.</p>
     </div>
-    <p class="auth-small">Trial: 3 days from first successful login.</p>
   </div>
-  <script src="/assets/login.js?v=5"></script>
+
+  <script src="/assets/login.js?v=14"></script>
 </body>
 </html>

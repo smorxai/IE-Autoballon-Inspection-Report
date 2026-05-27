@@ -3,37 +3,102 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Admin — Auto Ballooning</title>
+  <title>Super Admin — Inspection Report</title>
   <link rel="stylesheet" href="/assets/style.css?v=10" />
   <link rel="stylesheet" href="/assets/auth.css?v=1" />
 </head>
 <body class="auth-body">
   <div class="auth-card wide">
-    <h1>Admin</h1>
-    <p class="auth-hint">Mark users as paid, or reset a user password if email / temp password failed.</p>
+    <div class="admin-head">
+      <h1>Super Admin</h1>
+      <button type="button" id="btnLogout" class="btn-secondary">Log out</button>
+    </div>
+    <p class="auth-hint">
+      Only people you allow can use the app. Create an organization, add engineers, then enable
+      <strong>Active</strong> and permissions (Read / Write / Delete) under User access control.
+    </p>
     <div id="msg" class="auth-msg"></div>
+
+    <h2 class="admin-section">Organizations</h2>
+    <div class="admin-row">
+      <input type="text" id="orgName" placeholder="Organization name (e.g. Acme Engineering)" />
+      <button type="button" id="btnCreateOrg" class="primary">Create organization</button>
+    </div>
     <div class="table-wrap">
-      <table id="userTable">
+      <table>
         <thead>
-          <tr><th>Email</th><th>Role</th><th>Paid</th><th>Trial started</th></tr>
+          <tr>
+            <th>Name</th>
+            <th>Tenant ID</th>
+            <th>Engineers</th>
+            <th>Status</th>
+            <th>Trial ends</th>
+          </tr>
         </thead>
-        <tbody id="userBody"></tbody>
+        <tbody id="orgBody"></tbody>
       </table>
     </div>
-    <div class="admin-row">
-      <input type="email" id="paidEmail" placeholder="user@gmail.com" />
-      <button type="button" id="btnPaid" class="primary">Mark paid</button>
-    </div>
-    <h2 style="margin:1.25rem 0 0.5rem;font-size:1rem;">Reset user password</h2>
-    <p class="auth-hint" style="margin-top:0">Clears temporary-password mode so they can log in with the new password.</p>
+
+    <h2 class="admin-section">Engineers</h2>
     <div class="admin-row" style="flex-direction:column;align-items:stretch">
-      <input type="email" id="resetEmail" placeholder="user@gmail.com" autocomplete="username" />
-      <input type="password" id="resetPwd" placeholder="New password" autocomplete="new-password" />
-      <input type="password" id="resetPwd2" placeholder="Confirm new password" autocomplete="new-password" />
-      <button type="button" id="btnResetPwd" class="primary">Reset password</button>
+      <input type="text" id="engName" placeholder="Full name" />
+      <input type="email" id="engEmail" placeholder="Email" autocomplete="username" />
+      <select id="engTenant"></select>
+      <button type="button" id="btnCreateEng" class="primary">Add engineer</button>
     </div>
-    <p><a href="/app">← Back to app</a></p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Email</th>
+            <th>Username</th>
+            <th>Status</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="engBody"></tbody>
+      </table>
+    </div>
+
+    <h2 class="admin-section">User access control</h2>
+    <p class="auth-hint">
+      New engineers start <strong>inactive</strong> with no permissions. Check <strong>Active</strong> and
+      <strong>Read</strong> at minimum, then Save — or use <strong>Grant full access</strong>.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Username</th>
+            <th>Email</th>
+            <th>Read</th>
+            <th>Write</th>
+            <th>Delete</th>
+            <th>Active</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="permBody"></tbody>
+      </table>
+    </div>
+
+    <p><a href="/app">← Open ballooning app</a></p>
   </div>
-  <script src="/assets/admin.js?v=2"></script>
+
+  <div id="tempPwdModal" class="admin-modal" style="display:none">
+    <div class="admin-modal-inner">
+      <h3>Engineer created</h3>
+      <p class="auth-hint">Share this temporary password once. The engineer must change it on first login.</p>
+      <p><strong>Email:</strong> <span id="modalEmail"></span></p>
+      <p><strong>Temporary password:</strong> <code id="modalPwd"></code></p>
+      <p><strong>Tenant:</strong> <span id="modalTenant" class="mono"></span></p>
+      <button type="button" id="btnCloseModal" class="primary">Done</button>
+    </div>
+  </div>
+
+  <script src="/assets/auth.js?v=4"></script>
+  <script src="/assets/admin.js?v=5"></script>
 </body>
 </html>

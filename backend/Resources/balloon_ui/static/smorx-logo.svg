@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 108" role="img" aria-label="SmorX.ai">
+  <defs>
+    <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="50%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(0, 6)">
+    <rect x="0" y="0" width="72" height="72" rx="14" fill="#1e293b"/>
+    <text x="36" y="50" text-anchor="middle" font-family="Segoe UI, system-ui, sans-serif" font-size="42" font-weight="800" fill="url(#g)">S</text>
+    <path fill="#f8fafc" d="M48 14 L62 14 L72 32 L58 32 L54 24 L50 32 L36 32 Z"/>
+  </g>
+  <text x="88" y="46" font-family="Segoe UI, system-ui, sans-serif" font-size="36" font-weight="700" fill="url(#g)">Smor</text>
+  <text x="198" y="46" font-family="Segoe UI, system-ui, sans-serif" font-size="36" font-weight="700" fill="#f1f5f9">X</text>
+  <text x="224" y="46" font-family="Segoe UI, system-ui, sans-serif" font-size="36" font-weight="600" fill="#38bdf8">.ai</text>
+  <text x="88" y="72" font-family="Segoe UI, system-ui, sans-serif" font-size="12.5" fill="#94a3b8">Transforming Vision into Intelligent Systems</text>
+</svg>

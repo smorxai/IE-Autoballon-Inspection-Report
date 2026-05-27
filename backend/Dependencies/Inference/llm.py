@@ -16,6 +16,8 @@ warnings.filterwarnings('ignore')
 
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_API_VERSION = "2023-06-01"
 
 SONNET_3_MODEL_ID = "anthropic.claude-3-sonnet-20240229-v1:0" 
 SONNET_35_MODEL_ID = "apac.anthropic.claude-3-5-sonnet-20240620-v1:0"
@@ -36,6 +38,12 @@ class LLM():
         self._openaiApiKey = (
             (self._openaiConfig.get("openai_api_key") or self._openaiConfig.get("API_KEY") or "")
             or os.environ.get("OPENAI_API_KEY")
+            or ""
+        ).strip()
+        self._anthropicConfig = config.GetConfiguration("ANTHROPIC") or {}
+        self._anthropicApiKey = (
+            (self._anthropicConfig.get("API_KEY") or self._anthropicConfig.get("api_key") or "")
+            or os.environ.get("ANTHROPIC_API_KEY")
             or ""
         ).strip()
 
@@ -110,6 +118,98 @@ class LLM():
         except Exception as e:
             return {"status": "FAILED", "message": str(e)}
 
+    def _anthropic_headers(self) -> dict:
+        return {
+            "x-api-key": self._anthropicApiKey,
+            "anthropic-version": ANTHROPIC_API_VERSION,
+            "content-type": "application/json",
+        }
+
+    def _anthropic_extract_text(self, res: dict) -> str:
+        for block in res.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "text":
+                return str(block.get("text") or "")
+        return ""
+
+    def _anthropic_chat(self, prompt: str, max_tokens=4000, temperature=1, top_p=0.99):
+        if not self._anthropicApiKey:
+            return {"status": "FAILED", "message": "ANTHROPIC_API_KEY is not set"}
+        model = self._anthropicConfig.get("CHAT_MODEL", "claude-sonnet-4-6")
+        data = {
+            "model": model,
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        try:
+            response = requests.post(
+                ANTHROPIC_MESSAGES_URL,
+                headers=self._anthropic_headers(),
+                json=data,
+                timeout=180,
+            )
+            res = response.json()
+            if response.status_code != 200:
+                err = res.get("error", {})
+                msg = err.get("message", response.text) if isinstance(err, dict) else str(res)
+                return {"status": "FAILED", "message": f"Anthropic HTTP {response.status_code}: {msg}"}
+            text = self._anthropic_extract_text(res)
+            if text:
+                return {"status": "SUCCESS", "message": text}
+            return {"status": "FAILED", "message": str(res)}
+        except Exception as e:
+            return {"status": "FAILED", "message": str(e)}
+
+    def _anthropic_chat_with_image(
+        self, image_bytes: bytes, prompt: str, max_tokens=500, temperature=1, top_p=0.999
+    ):
+        if not self._anthropicApiKey:
+            return {"status": "FAILED", "message": "ANTHROPIC_API_KEY is not set"}
+        model = self._anthropicConfig.get("VISION_MODEL", "claude-sonnet-4-6")
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+        data = {
+            "model": model,
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": b64,
+                            },
+                        },
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ],
+        }
+        try:
+            response = requests.post(
+                ANTHROPIC_MESSAGES_URL,
+                headers=self._anthropic_headers(),
+                json=data,
+                timeout=180,
+            )
+            res = response.json()
+            if response.status_code != 200:
+                err = res.get("error", {})
+                msg = err.get("message", response.text) if isinstance(err, dict) else str(res)
+                return {
+                    "status": "FAILED",
+                    "message": f"Anthropic vision HTTP {response.status_code}: {msg}",
+                }
+            text = self._anthropic_extract_text(res)
+            if text:
+                return {"status": "SUCCESS", "message": text}
+            return {"status": "FAILED", "message": str(res)}
+        except Exception as e:
+            return {"status": "FAILED", "message": str(e)}
+
     def _openai_chat(self, prompt: str, max_tokens=4000, temperature=1, top_p=0.99):
         if not self._openaiApiKey:
             return {"status": "FAILED", "message": "OPENAI openai_api_key is not set (config OPENAI.openai_api_key or env OPENAI_API_KEY)"}
@@ -178,7 +278,11 @@ class LLM():
         output (str): Output result by the LLM model.
     '''
     def Chat(self, prompt:str, maxTokens=4000, temperature=1, topP=0.99):
-            if self._openaiConfig.get("USE_FOR_CHAT") and self._openaiApiKey:
+            if self._anthropicApiKey:
+                return self._anthropic_chat(
+                    prompt, max_tokens=maxTokens, temperature=temperature, top_p=topP
+                )
+            if self._openaiApiKey:
                 return self._openai_chat(prompt, max_tokens=maxTokens, temperature=temperature, top_p=topP)
             if self._groqConfig.get("USE_FOR_CHAT") and self._groqApiKey:
                 return self._groq_chat(prompt, max_tokens=maxTokens, temperature=temperature, top_p=topP)
@@ -189,7 +293,10 @@ class LLM():
             #     return self.ChatWithGemini(...)
 
             if not self._bedrockRuntime:
-                return {"status": "FAILED", "message": "No LLM backend: set OPENAI or GROQ in config, or configure AWS keys for Bedrock."}
+                return {
+                    "status": "FAILED",
+                    "message": "No LLM backend: set ANTHROPIC_API_KEY, OPENAI, GROQ, or AWS Bedrock.",
+                }
 
             NativeRequest = {
                     "anthropic_version": "bedrock-2023-05-31",
@@ -356,16 +463,20 @@ class LLM():
     '''
     def ChatWithImage(self, imageBytes=None, prompt:str=None, maxTokens=500, temperature=1, topP=0.999, modelId=SONNET_4_MODEL_ID):
         try:
-            if self._openaiApiKey and (
-                self._openaiConfig.get("USE_FOR_VISION") or self._openaiConfig.get("USE_FOR_CHAT")
-            ):
+            use_prompt = (
+                prompt
+                if prompt
+                else "Decribe the file given to you and ask user for any specific question."
+            )
+            if self._anthropicApiKey:
                 if imageBytes is None:
                     return {"status": "FAILED", "message": "No image uploaded"}
-                use_prompt = (
-                    prompt
-                    if prompt
-                    else "Decribe the file given to you and ask user for any specific question."
+                return self._anthropic_chat_with_image(
+                    imageBytes, use_prompt, max_tokens=maxTokens, temperature=temperature, top_p=topP
                 )
+            if self._openaiApiKey:
+                if imageBytes is None:
+                    return {"status": "FAILED", "message": "No image uploaded"}
                 return self._openai_chat_with_image(
                     imageBytes, use_prompt, max_tokens=maxTokens, temperature=temperature, top_p=topP
                 )
@@ -384,7 +495,7 @@ class LLM():
             if not self._bedrockRuntime:
                 return {
                     "status": "FAILED",
-                    "message": "No vision LLM: set OPENAI or GROQ in config, or configure AWS Bedrock keys.",
+                    "message": "No vision LLM: set ANTHROPIC_API_KEY, OPENAI, GROQ, or AWS Bedrock.",
                 }
 
             if imageBytes and prompt:

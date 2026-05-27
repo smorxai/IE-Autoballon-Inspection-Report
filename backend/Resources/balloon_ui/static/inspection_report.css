@@ -21,14 +21,14 @@
   min-height: 100vh;
 }
 
-/* —— Header (logo + highlighted title) —— */
+/* —— Header (logo only — no full-width bar) —— */
 .ir-top {
   display: flex;
   align-items: center;
   gap: 1.25rem;
-  padding: 0.75rem 1.5rem;
-  background: #050608;
-  border-bottom: 1px solid #141a22;
+  padding: 0.5rem 0 0.75rem;
+  background: transparent;
+  border: none;
 }
 .ir-top .ir-nav-pills {
   margin-left: auto;
@@ -40,10 +40,32 @@
   text-decoration: none;
 }
 
+.ir-brand .brand-logo,
 .ir-brand img {
+  display: block;
+  height: auto;
+  width: auto;
   max-height: 72px;
+  max-width: min(280px, 100%);
+  object-fit: contain;
+  object-position: left center;
+}
+.ir-brand .brand-logo--full {
+  width: min(300px, 100%);
+  max-height: 92px;
+  height: auto;
+  border-radius: 6px;
 }
 
+.ir-center-title {
+  flex: 1;
+  margin: 0;
+  font-size: 1.35rem;
+  font-weight: 700;
+  text-align: center;
+  color: #1a2332;
+  min-width: 0;
+}
 .ir-title-highlight {
   flex: 1;
   margin: 0;
@@ -266,19 +288,19 @@
 .ir-table input.ir-pass {
   border-color: #16a34a;
   border-width: 2px;
-  background: #fff;
+  background: #ecfdf5;
 }
 
 .ir-table input.ir-warn {
-  border-color: #ea580c;
+  border-color: #ca8a04;
   border-width: 2px;
-  background: #fff;
+  background: #fefce8;
 }
 
 .ir-table input.ir-fail {
   border-color: #dc2626;
   border-width: 2px;
-  background: #fff;
+  background: #fef2f2;
 }
 
 .ir-status-dot {
@@ -296,8 +318,8 @@
 }
 
 .ir-status-dot.warn {
-  background: #f59e0b;
-  border-color: #d97706;
+  background: #eab308;
+  border-color: #ca8a04;
 }
 
 .ir-status-dot.fail {
@@ -309,12 +331,23 @@
   min-width: 6.5rem;
 }
 
-/* Column +/- controls (black buttons, stacked) */
-.ir-th-colctrl {
-  background: #b8daf0 !important;
+/* Inspection & results header with inline column controls */
+.ir-inspection-results-head {
+  text-align: center;
   vertical-align: middle;
-  padding: 0.25rem !important;
-  min-width: 3.2rem;
+}
+
+.ir-inspection-head-inner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem 0.85rem;
+}
+
+.ir-inspection-title {
+  font-weight: 700;
+  white-space: nowrap;
 }
 
 .ir-colctrl-btns {
@@ -322,6 +355,32 @@
   flex-direction: column;
   gap: 0.35rem;
   align-items: center;
+}
+
+.ir-colctrl-btns--inline {
+  flex-direction: row;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.ir-top-actions .btn-secondary {
+  padding: 0.45rem 0.9rem;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid #94a3b8;
+  background: #f1f5f9;
+  color: #1e293b;
+}
+
+.ir-top-actions .btn-secondary:hover:not(:disabled) {
+  background: #e2e8f0;
+}
+
+.ir-top-actions .btn-secondary:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .ir-colctrl-btns button {

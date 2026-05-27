@@ -1,41 +1,97 @@
 """
-PostgreSQL (Neon) database connection via SQLAlchemy.
+Auth database connection via SQLAlchemy.
 
-All auth tables (organizations, users, activities) live in this database.
-The existing MongoDB connection in serve_balloon.py is untouched.
+Production: set DATABASE_URL to a PostgreSQL (Neon) connection string.
+Local dev:   if DATABASE_URL is empty, uses backend/.data/auth.sqlite automatically.
+             If Neon/Postgres is unreachable, set AUTH_USE_SQLITE=1 or rely on
+             BALLOON_AUTH_FALLBACK_SQLITE=1 (default) to use local SQLite.
 """
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-# ---------------------------------------------------------------------------
-# Connection string
-# Override via environment variable DATABASE_URL to avoid hardcoding in prod.
-# channel_binding=require is a Neon/SCRAM requirement; psycopg2 >= 2.9.3 supports it.
-# ---------------------------------------------------------------------------
-NEON_DATABASE_URL: str = os.environ.get("DATABASE_URL", "").strip()
-if not NEON_DATABASE_URL:
+_BACKEND_DIR = Path(__file__).resolve().parent.parent
+_SQLITE_PATH = _BACKEND_DIR / ".data" / "auth.sqlite"
+
+
+def _sqlite_url() -> str:
+    _SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    return f"sqlite:///{_SQLITE_PATH.as_posix()}"
+
+
+def _postgres_reachable(url: str, timeout_sec: float = 8.0) -> bool:
+    try:
+        probe = create_engine(
+            url,
+            pool_pre_ping=True,
+            connect_args={"connect_timeout": int(timeout_sec)},
+        )
+        with probe.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        probe.dispose()
+        return True
+    except Exception as exc:
+        print(f"[auth] PostgreSQL probe failed: {exc}")
+        return False
+
+
+def resolve_database_url() -> str:
+    force_sqlite = os.environ.get("AUTH_USE_SQLITE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if force_sqlite:
+        print("[auth] AUTH_USE_SQLITE=1 — using local SQLite auth database.")
+        return _sqlite_url()
+
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if url.startswith("sqlite:"):
+        return url
+    if url.startswith("postgresql://") or url.startswith("postgres://"):
+        fallback = os.environ.get("BALLOON_AUTH_FALLBACK_SQLITE", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        if fallback and not _postgres_reachable(url):
+            print(
+                "[auth] PostgreSQL unreachable — falling back to local SQLite "
+                f"({_SQLITE_PATH}). Fix DATABASE_URL for production, or set AUTH_USE_SQLITE=1."
+            )
+            return _sqlite_url()
+        return url
+    return _sqlite_url()
+
+
+DATABASE_URL: str = resolve_database_url()
+IS_SQLITE: bool = DATABASE_URL.startswith("sqlite")
+
+if IS_SQLITE:
+    print(f"[auth] Using local SQLite auth database → {_SQLITE_PATH}")
+elif not os.environ.get("DATABASE_URL", "").strip():
     print("[auth] WARNING: DATABASE_URL is not set — PostgreSQL auth will not connect.")
+else:
+    print("[auth] Using PostgreSQL auth database.")
 
-engine = create_engine(
-    NEON_DATABASE_URL or "postgresql://127.0.0.1:5432/neondb",
-    pool_pre_ping=True,   # verify connection before each use
-    pool_size=5,
-    max_overflow=10,
-    echo=False,           # set True to log all SQL (development only)
-)
+_engine_kwargs: dict = {"echo": False, "pool_pre_ping": True}
+if IS_SQLITE:
+    _engine_kwargs["connect_args"] = {"check_same_thread": False}
+else:
+    _engine_kwargs.update({"pool_size": 5, "max_overflow": 10})
+
+engine = create_engine(DATABASE_URL, **_engine_kwargs)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
 
 
-# ---------------------------------------------------------------------------
-# FastAPI dependency — yields a DB session per request
-# ---------------------------------------------------------------------------
 def get_db():
     """Yield a SQLAlchemy session; always close it after the request."""
     db = SessionLocal()
@@ -45,34 +101,58 @@ def get_db():
         db.close()
 
 
-# ---------------------------------------------------------------------------
-# Table initialisation + super-admin seeding (called once at startup)
-# ---------------------------------------------------------------------------
 def init_db() -> None:
     """Create all tables if they don't exist and seed the super admin."""
-    # Import models so SQLAlchemy sees their metadata before create_all
     from auth import models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+    _migrate_schema()
     _seed_super_admin()
 
 
-def _seed_super_admin() -> None:
-    """
-    Create the one-and-only super admin if none exists yet.
+def _migrate_schema() -> None:
+    """Add new columns to existing deployments without Alembic."""
+    from sqlalchemy import inspect, text
 
-    Credentials come from environment variables:
-      SUPER_ADMIN_EMAIL    (default: admin@smorx.ai)
-      SUPER_ADMIN_PASSWORD (default: auto-generated, printed once to console)
-    """
-    from auth.models import User, RoleEnum
-    from auth.utils import hash_password, generate_temp_password
+    insp = inspect(engine)
+    if "users" not in insp.get_table_names():
+        return
+
+    existing = {c["name"] for c in insp.get_columns("users")}
+    alters: list[str] = []
+    if "username" not in existing:
+        alters.append("ALTER TABLE users ADD COLUMN username VARCHAR(64)")
+    if "email_verified" not in existing:
+        alters.append("ALTER TABLE users ADD COLUMN email_verified BOOLEAN DEFAULT FALSE")
+    if "can_read" not in existing:
+        alters.append("ALTER TABLE users ADD COLUMN can_read BOOLEAN DEFAULT TRUE")
+    if "can_write" not in existing:
+        alters.append("ALTER TABLE users ADD COLUMN can_write BOOLEAN DEFAULT TRUE")
+    if "can_delete" not in existing:
+        alters.append("ALTER TABLE users ADD COLUMN can_delete BOOLEAN DEFAULT TRUE")
+    if "is_active" not in existing:
+        alters.append("ALTER TABLE users ADD COLUMN is_active BOOLEAN DEFAULT TRUE")
+
+    if not alters:
+        return
+
+    with engine.begin() as conn:
+        for ddl in alters:
+            try:
+                conn.execute(text(ddl))
+            except Exception as exc:
+                print(f"[auth] Migration note ({ddl}): {exc}")
+
+
+def _seed_super_admin() -> None:
+    from auth.models import RoleEnum, User
+    from auth.utils import generate_temp_password, hash_password
 
     db = SessionLocal()
     try:
         existing = db.query(User).filter_by(role=RoleEnum.super_admin).first()
         if existing:
-            return  # super admin already exists
+            return
 
         email = os.environ.get("SUPER_ADMIN_EMAIL", "admin@smorx.ai").strip().lower()
         raw_password = os.environ.get("SUPER_ADMIN_PASSWORD", "").strip()
@@ -82,19 +162,24 @@ def _seed_super_admin() -> None:
             raw_password = generate_temp_password()
             is_temp = True
             print(
-                f"\n[auth] ⚠  No SUPER_ADMIN_PASSWORD set — generated one-time password:\n"
+                f"\n[auth] No SUPER_ADMIN_PASSWORD set — generated one-time password:\n"
                 f"          Email   : {email}\n"
                 f"          Password: {raw_password}\n"
-                f"          Change this immediately after first login.\n"
             )
 
         admin = User(
             name="Super Admin",
             email=email,
+            username="superadmin",
             password_hash=hash_password(raw_password),
             role=RoleEnum.super_admin,
             tenant_id=None,
             is_temp_password=is_temp,
+            email_verified=True,
+            can_read=True,
+            can_write=True,
+            can_delete=True,
+            is_active=True,
         )
         db.add(admin)
         db.commit()

@@ -30,6 +30,9 @@
     return localStorage.getItem("balloon_token") || null;
   }
 
+  var authEnabled = true;
+  var authReady = false;
+
   const fileInput = document.getElementById("file");
   const runBtn = document.getElementById("runBtn");
   const statusEl = document.getElementById("status");
@@ -41,8 +44,167 @@
   const downloadBalloon = document.getElementById("downloadBalloon");
   const downloadExcel = document.getElementById("downloadExcel");
   const inspectionReport = document.getElementById("inspectionReport");
+  var showDetectionBoxes = false;
   const INSPECTION_STORAGE_KEY = "smorx_inspection_payload";
+  const INSPECTION_META_KEY = "smorx_inspection_meta";
+
+  function enrichDetectionItems(det) {
+    if (!det || !window.BalloonParse) return;
+    if (BalloonParse.hideIncompleteBalloons) {
+      BalloonParse.hideIncompleteBalloons(det);
+    }
+    if (BalloonParse.itemsForTable) {
+      det.balloon_items = BalloonParse.itemsForTable(det);
+    }
+    (det.balloon_items || []).forEach(function (it) {
+      BalloonParse.enrichBalloonItem(it);
+    });
+  }
+
+  function balloonItemsList(det) {
+    if (!det) return [];
+    if (window.BalloonParse && BalloonParse.itemsForTable) {
+      return BalloonParse.itemsForTable(det);
+    }
+    return det.balloon_items || [];
+  }
+
+  /** Same numbered balloons as on the drawing (not internal raw detections). */
+  function displayItemsList(det) {
+    return balloonItemsList(det);
+  }
+
+  function visibleBalloonTotal(det) {
+    if (window.BalloonParse && BalloonParse.visibleBalloonCount) {
+      return BalloonParse.visibleBalloonCount(det);
+    }
+    return balloonItemsList(det).length;
+  }
+
+  function findBalloonItemByNumber(det, num) {
+    const items = balloonItemsList(det);
+    const n = String(num);
+    for (let i = 0; i < items.length; i++) {
+      const bn = items[i].balloon_number != null ? String(items[i].balloon_number) : String(i + 1);
+      if (bn === n) return items[i];
+    }
+    return null;
+  }
+
+  function refreshInspectionReportButton() {
+    const det = lastJson && lastJson.detection;
+    setInspectionReportEnabled(!!det && visibleBalloonTotal(det) > 0);
+  }
+
+  /** After delete/add: renumber 1…n (top→bottom, left→right), refresh Details + inspection payload. */
+  function afterBalloonListChanged(optDet) {
+    const det = optDet || (lastJson && lastJson.detection);
+    if (!det) return;
+    renumberBalloonsReadingOrder(det);
+    applyBalloonNumberingPipeline(det);
+    enrichDetectionItems(det);
+    if (visibleBalloonTotal(det) > 0) {
+      try {
+        persistInspectionPayload(lastJson);
+      } catch (e) {
+        /* localStorage quota — report still updates on next open */
+      }
+    }
+    refreshInspectionReportButton();
+  }
+
+  /** Server already ran pipeline; client only syncs table ↔ canvas unless manual re-edit. */
+  function applyBalloonNumberingPipeline(optDet) {
+    const det = optDet || (lastJson && lastJson.detection);
+    if (!det) return;
+    if (window.BalloonParse && BalloonParse.ensureDrawingAnnotations) {
+      BalloonParse.ensureDrawingAnnotations(det);
+    }
+    if (!det.balloon_pipeline_complete) {
+      if (window.BalloonParse && BalloonParse.expandMultiplierBalloons) {
+        BalloonParse.expandMultiplierBalloons(det);
+      } else if (window.BalloonParse && BalloonParse.repairMultiplierDrawingAnnotations) {
+        BalloonParse.repairMultiplierDrawingAnnotations(det);
+      }
+      if (window.BalloonParse && BalloonParse.removeDuplicateYoloDetectionsNearMultiplier) {
+        BalloonParse.removeDuplicateYoloDetectionsNearMultiplier(det);
+      }
+    }
+    if (window.BalloonParse && BalloonParse.syncBalloonItemsFromDetections) {
+      BalloonParse.syncBalloonItemsFromDetections(det);
+    }
+  }
+
+  function persistInspectionPayload(data) {
+    if (!data) return;
+    enrichDetectionItems(data.detection);
+    if (data.detection) applyBalloonNumberingPipeline(data.detection);
+    if (window.BalloonParse && BalloonParse.saveInspectionMetaFromDetection && data.detection) {
+      BalloonParse.saveInspectionMetaFromDetection(data.detection);
+    }
+    if (window.InspectionStore) {
+      if (InspectionStore.setBalloonAppUrl) {
+        InspectionStore.setBalloonAppUrl(window.location.origin + "/app");
+      }
+      if (InspectionStore.setDashboardUrl) {
+        InspectionStore.setDashboardUrl("http://localhost:3000/dashboard");
+      }
+    }
+    var payloadOut =
+      window.InspectionStore && InspectionStore.slimInspectionPayload
+        ? InspectionStore.slimInspectionPayload(data)
+        : data;
+    try {
+      if (window.InspectionStore && InspectionStore.setPayload) {
+        InspectionStore.setPayload(payloadOut);
+      } else {
+        var json = JSON.stringify(payloadOut);
+        localStorage.setItem(INSPECTION_STORAGE_KEY, json);
+        try {
+          sessionStorage.setItem(INSPECTION_STORAGE_KEY, json);
+        } catch (e) { /* ignore quota */ }
+      }
+    } catch (storageErr) {
+      throw storageErr;
+    }
+  }
   const adminLink = document.getElementById("adminLink");
+  const logoutBtnEl = document.getElementById("logoutBtn");
+
+  (function initAuthGate() {
+    if (!window.BalloonAuth) {
+      authReady = true;
+      return;
+    }
+    BalloonAuth.requireAppAccess().then(function (ctx) {
+      authReady = true;
+      if (!ctx) return;
+      authEnabled = !!ctx.cfg.auth_enabled;
+      var me = ctx.me;
+      if (me && BalloonAuth.applyPermissionUi) BalloonAuth.applyPermissionUi(me);
+      if (authEnabled && logoutBtnEl) logoutBtnEl.style.display = "inline-block";
+      if (me && me.role === "super_admin" && adminLink) {
+        adminLink.style.display = "inline-block";
+      }
+    }).catch(function () {
+      authReady = true;
+    });
+  })();
+
+  (function clearOversizedInspectionCache() {
+    try {
+      var raw = localStorage.getItem(INSPECTION_STORAGE_KEY);
+      if (raw && raw.length > 800000) localStorage.removeItem(INSPECTION_STORAGE_KEY);
+    } catch (e) { /* ignore */ }
+  })();
+
+  if (logoutBtnEl) {
+    logoutBtnEl.addEventListener("click", function () {
+      if (window.BalloonAuth) BalloonAuth.setToken(null);
+      else localStorage.removeItem("balloon_token");
+      window.location.href = "/login";
+    });
+  }
   const dashboardBtn = document.getElementById("dashboardBtn");
 
   let lastFile = null;
@@ -63,7 +225,11 @@
   const btnModeCreate = document.getElementById("btnModeCreate");
   const btnModeEdit = document.getElementById("btnModeEdit");
   const btnModeDelete = document.getElementById("btnModeDelete");
+  const btnUndoDelete = document.getElementById("btnUndoDelete");
   const btnModeSave = document.getElementById("btnModeSave");
+  /** Stack of delete undo snapshots (newest last); each click restores one balloon. */
+  const DELETE_UNDO_MAX = 40;
+  let deleteUndoStack = [];
   const modeHintEl = document.getElementById("modeHint");
   const btnBalloonMenu = document.getElementById("btnBalloonMenu");
   const balloonQuickPanel = document.getElementById("balloonQuickPanel");
@@ -336,7 +502,8 @@
   function buildQuickTableFromDetection() {
     if (!quickBalloonBody) return;
     quickBalloonBody.innerHTML = "";
-    const items = (lastJson && lastJson.detection && lastJson.detection.balloon_items) || [];
+    const det = lastJson && lastJson.detection;
+    const items = det ? displayItemsList(det) : [];
     items.forEach(function (it) {
       appendQuickRowFromItem(it);
     });
@@ -445,12 +612,13 @@
     renderResultTable(lastJson);
     paintBalloonCanvas();
     syncJsonFromTable();
-    setStatus("Quick table saved — same values appear in Detected details below.");
+    setStatus("Quick table saved — same values appear in Details below.");
     setQuickPanelOpen(false);
   }
 
   function applyBalloonSave() {
     if (!lastJson || !lastJson.detection) return;
+    clearDeleteUndoStack();
     const det = lastJson.detection;
     const sx = getCanvasScale(det);
     const anns = det.drawing_annotations || [];
@@ -511,7 +679,10 @@
     })
       .then(function (r) {
         if (authRedirect(r.status)) return null;
-        return r.json();
+        return r.json().then(function (j) {
+          if (authRedirect(r.status, j)) return null;
+          return j;
+        });
       })
       .then(function (j) {
         if (!j || !j.ok || !j.extract) {
@@ -522,8 +693,10 @@
         it.nominal_value = ex.nominal_value != null ? String(ex.nominal_value) : "";
         it.tolerance = ex.tolerance != null ? String(ex.tolerance) : "";
         it.others = ex.others != null ? String(ex.others) : "";
+        applyBalloonNumberingPipeline();
         syncJsonFromTable();
         renderResultTable(lastJson);
+        paintBalloonCanvas();
         setStatus("Manual balloon: nominal / tolerance filled like auto-detect.");
       })
       .catch(function () {
@@ -581,16 +754,18 @@
   /**
    * Sort by bbox center: top→bottom, then left→right. Assign ids 1…n (same as backend tblr rules).
    */
-  function renumberBalloonsReadingOrder() {
-    if (!lastJson || !lastJson.detection) return;
-    const det = lastJson.detection;
+  function renumberBalloonsReadingOrder(optDet) {
+    const det = optDet || (lastJson && lastJson.detection);
+    if (!det) return;
+    if (window.BalloonParse && BalloonParse.ensureDrawingAnnotations) {
+      BalloonParse.ensureDrawingAnnotations(det);
+    }
     const dets = det.detections || [];
     const anns = det.drawing_annotations || [];
-    const items = det.balloon_items || [];
-    const n = Math.min(dets.length, anns.length, items.length);
+    const n = Math.min(dets.length, anns.length);
     if (n === 0) {
       if (dets.length === 0 && anns.length === 0) {
-        det.balloon_items = [];
+        det.balloon_items = det.balloon_items || [];
         det.count = 0;
         balloonUiOverrides = {};
         det.balloon_ui_overrides = {};
@@ -598,12 +773,11 @@
       return;
     }
 
-    /** Top edge (y1), then left edge (x1) — stable left-to-right on the same row. */
     function bboxReadingOrderKey(di) {
       let bb = dets[di] && dets[di].bbox;
       if (!bb || bb.length < 4) {
         const a = anns[di];
-        bb = a && a.BBox;
+        bb = a && (a.BBox || a.bbox);
       }
       if (!bb || bb.length < 4) return [1e30, 1e30];
       return [Number(bb[1]), Number(bb[0])];
@@ -620,32 +794,116 @@
     });
 
     const mergedOv = Object.assign({}, det.balloon_ui_overrides || {}, balloonUiOverrides);
-    const newDets = [];
-    const newAnns = [];
-    const newItems = [];
-    const newOverrides = {};
-    for (let j = 0; j < n; j++) {
+    const detIndexToNewId = {};
+    const newDets = dets.slice();
+    const newAnns = anns.slice();
+    const newOverrides = Object.assign({}, mergedOv);
+
+    for (let j = 0; j < indices.length; j++) {
       const oi = indices[j];
       const newId = j + 1;
       const oldId = anns[oi].id;
-      newDets.push(dets[oi]);
+      detIndexToNewId[oi] = newId;
       const ann = Object.assign({}, anns[oi]);
       ann.id = newId;
-      newAnns.push(ann);
-      const it = Object.assign({}, items[oi]);
-      it.balloon_number = newId;
-      newItems.push(it);
+      delete ann.canvas_skip;
+      delete ann.display_id;
+      delete ann.report_only;
+      newAnns[oi] = ann;
+      newDets[oi] = dets[oi];
       if (mergedOv[oldId] && Number.isFinite(mergedOv[oldId].cx) && Number.isFinite(mergedOv[oldId].cy)) {
         newOverrides[newId] = mergedOv[oldId];
+        delete newOverrides[oldId];
       }
     }
 
     det.detections = newDets;
     det.drawing_annotations = newAnns;
-    det.balloon_items = newItems;
     det.count = newDets.length;
     balloonUiOverrides = newOverrides;
     det.balloon_ui_overrides = Object.assign({}, newOverrides);
+
+    if (window.BalloonParse && BalloonParse.syncBalloonItemsFromDetectionIds) {
+      BalloonParse.syncBalloonItemsFromDetectionIds(det, detIndexToNewId);
+    }
+  }
+
+  function cloneJson(value) {
+    try {
+      return JSON.parse(JSON.stringify(value));
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function clearDeleteUndoStack() {
+    deleteUndoStack = [];
+    updateUndoDeleteButton();
+  }
+
+  function updateUndoDeleteButton() {
+    if (!btnUndoDelete) return;
+    const n = deleteUndoStack.length;
+    if (n < 1) {
+      btnUndoDelete.hidden = true;
+      return;
+    }
+    const last = deleteUndoStack[n - 1];
+    const id = last && last.balloonId != null ? last.balloonId : "?";
+    btnUndoDelete.hidden = false;
+    btnUndoDelete.textContent =
+      n === 1 ? "Undo delete (" + id + ")" : "Undo delete (" + id + ") · " + n + " left";
+    btnUndoDelete.title =
+      "Restore the last deleted balloon (" +
+      n +
+      " undo step" +
+      (n === 1 ? "" : "s") +
+      " available)";
+  }
+
+  function captureDeleteUndoSnapshot(balloonId) {
+    if (!lastJson || !lastJson.detection) return;
+    deleteUndoStack.push({
+      balloonId: balloonId,
+      detection: cloneJson(lastJson.detection),
+      balloonUiOverrides: cloneJson(balloonUiOverrides || {}),
+      detBalloonUiOverrides: cloneJson(lastJson.detection.balloon_ui_overrides || {}),
+    });
+    if (deleteUndoStack.length > DELETE_UNDO_MAX) {
+      deleteUndoStack.shift();
+    }
+    updateUndoDeleteButton();
+  }
+
+  function undoLastBalloonDelete() {
+    if (!deleteUndoStack.length || !lastJson) return false;
+    const snap = deleteUndoStack.pop();
+    if (!snap || !snap.detection) {
+      updateUndoDeleteButton();
+      return false;
+    }
+    lastJson.detection = snap.detection;
+    balloonUiOverrides = snap.balloonUiOverrides || {};
+    lastJson.detection.balloon_ui_overrides = snap.detBalloonUiOverrides || {};
+    const restoredId = snap.balloonId;
+    afterBalloonListChanged(lastJson.detection);
+    syncJsonFromTable();
+    renderResultTable(lastJson);
+    paintBalloonCanvas();
+    updateUndoDeleteButton();
+    const left = deleteUndoStack.length;
+    setStatus(
+      left
+        ? "Restored balloon " + restoredId + ". " + left + " more undo step(s) available."
+        : "Restored balloon " + restoredId + "."
+    );
+    showToast(
+      left
+        ? "Balloon " + restoredId + " restored. " + left + " undo(s) left — Save when done."
+        : "Balloon " + restoredId + " restored. Click Save to keep changes.",
+      "success"
+    );
+    return true;
   }
 
   function deleteBalloonById(balloonId) {
@@ -657,6 +915,8 @@
     });
     if (idx < 0) return false;
 
+    captureDeleteUndoSnapshot(balloonId);
+
     const dets = det.detections || [];
     const items = det.balloon_items || [];
 
@@ -667,12 +927,26 @@
     det.detections = dets;
     det.drawing_annotations = anns;
     det.balloon_items = items;
+    det.count = dets.length;
+    if (balloonUiOverrides[balloonId]) delete balloonUiOverrides[balloonId];
+    det.balloon_ui_overrides = Object.assign({}, balloonUiOverrides);
 
-    renumberBalloonsReadingOrder();
+    afterBalloonListChanged(det);
     syncJsonFromTable();
     renderResultTable(lastJson);
     paintBalloonCanvas();
-    setStatus("Removed balloon. Numbers follow top→bottom, left→right. Click Save to commit.");
+    const undos = deleteUndoStack.length;
+    const nLeft = visibleBalloonTotal(det);
+    setStatus(
+      "Removed balloon " +
+        balloonId +
+        ". Remaining " +
+        nLeft +
+        " balloon(s) renumbered 1–" +
+        nLeft +
+        " (Details and Inspection report updated)." +
+        (undos > 1 ? " Undo delete (" + undos + " steps)." : " Undo delete to restore.")
+    );
     return true;
   }
 
@@ -691,6 +965,9 @@
   function setInspectionReportEnabled(on) {
     if (!inspectionReport) return;
     inspectionReport.disabled = !on;
+    inspectionReport.title = on
+      ? "Open inspection report"
+      : "Run auto ballooning first";
     inspectionReport.setAttribute("aria-pressed", on ? "true" : "false");
   }
 
@@ -736,7 +1013,8 @@
     setBalloonDownloadEnabled(false);
     setExcelDownloadEnabled(false);
     setInspectionReportEnabled(false);
-    if (resultBody) resultBody.innerHTML = "<tr><td colspan=\"5\">Run auto ballooning to see extracted values.</td></tr>";
+    if (resultBody) resultBody.innerHTML = "<tr><td colspan=\"5\">Run the application to see extracted values.</td></tr>";
+    refreshInspectionReportButton();
     clearPanel(panelBalloon, "Run auto ballooning to see balloons here.");
     clearPanel(panelInput);
     setInputDownloadEnabled(false);
@@ -744,10 +1022,14 @@
     revokeInputPdfPreview();
     quickPanelSavedPos = null;
     setQuickPanelOpen(false);
+    clearDeleteUndoStack();
     setStatus("");
   }
 
-  function authRedirect(status) {
+  function authRedirect(status, data) {
+    if (window.BalloonAuth && BalloonAuth.redirectFromAuthError(status, data)) {
+      return true;
+    }
     if (status === 401) {
       window.location.href = "/login";
       return true;
@@ -792,8 +1074,8 @@
 
       // table_data — flat list used for the balloon items table
       let tableData = null;
-      if (det && det.balloon_items) {
-        tableData = det.balloon_items.map(stripCrop);
+      if (det) {
+        tableData = displayItemsList(det).map(stripCrop);
       }
 
       // balloon_data — full detection payload (crops stripped)
@@ -841,24 +1123,19 @@
         showToast("No data to save — redirecting to dashboard", "info");
       }
 
-      // Always navigate to dashboard
+      if (window.InspectionStore && InspectionStore.setDashboardUrl) {
+        InspectionStore.setDashboardUrl("http://localhost:3000/dashboard");
+      }
       resetSession();
       setTimeout(function () {
-        window.location.href = "http://localhost:3000/dashboard";
+        var dash =
+          window.InspectionStore && InspectionStore.getDashboardUrl
+            ? InspectionStore.getDashboardUrl()
+            : "http://localhost:3000/dashboard";
+        window.location.href = dash;
       }, 800);
     });
   }
-
-  fetch(ORIGIN + "/api/auth/me", cred)
-    .then(function (r) {
-      return r.json();
-    })
-    .then(function (me) {
-      if (me && me.ok && me.role === "admin" && adminLink) {
-        adminLink.style.display = "inline-block";
-      }
-    })
-    .catch(function () {});
 
   function syncJsonFromTable() {
     if (jsonOut && lastJson) jsonOut.textContent = JSON.stringify(lastJson, null, 2);
@@ -883,13 +1160,21 @@
 
   function renderResultTable(data) {
     if (!resultBody) return;
-    const items = ((data || {}).detection || {}).balloon_items || [];
+    const det = (data || {}).detection;
+    var items = det ? displayItemsList(det) : [];
+    if (window.BalloonParse && BalloonParse.sortBalloonItemsTblr) {
+      items = BalloonParse.sortBalloonItemsTblr(items);
+    }
     if (!items.length) {
-      resultBody.innerHTML = "<tr><td colspan=\"5\">No extracted values found.</td></tr>";
+      resultBody.innerHTML =
+        "<tr><td colspan=\"5\">Run auto ballooning — each red balloon on the drawing appears here (not internal detections).</td></tr>";
       return;
     }
     resultBody.innerHTML = "";
     items.forEach(function (it, idx) {
+      if (window.BalloonParse && BalloonParse.enrichBalloonItem) {
+        BalloonParse.enrichBalloonItem(it);
+      }
       let nominal = it.nominal_value != null ? String(it.nominal_value) : "";
       let tol = it.tolerance != null ? String(it.tolerance) : "";
       let others = it.others != null ? String(it.others) : "";
@@ -901,6 +1186,7 @@
       const tdNum = document.createElement("td");
       tdNum.textContent = it.balloon_number != null ? String(it.balloon_number) : "";
       const tdClass = document.createElement("td");
+      tdClass.className = "col-class";
       tdClass.textContent = cls;
       const tdNom = document.createElement("td");
       tdNom.className = "col-nominal";
@@ -910,8 +1196,13 @@
       inpNom.value = nominal;
       inpNom.placeholder = "empty";
       inpNom.addEventListener("input", function () {
-        if (!lastJson || !lastJson.detection || !lastJson.detection.balloon_items[idx]) return;
-        lastJson.detection.balloon_items[idx].nominal_value = inpNom.value;
+        const row =
+          lastJson && lastJson.detection && window.BalloonParse && BalloonParse.findBalloonItem
+            ? BalloonParse.findBalloonItem(lastJson.detection, it)
+            : null;
+        if (!row) return;
+        row.nominal_value = inpNom.value;
+        if (window.BalloonParse) BalloonParse.enrichBalloonItem(row);
         syncJsonFromTable();
       });
       tdNom.appendChild(inpNom);
@@ -923,8 +1214,13 @@
       inpTol.value = tol;
       inpTol.placeholder = "empty";
       inpTol.addEventListener("input", function () {
-        if (!lastJson || !lastJson.detection || !lastJson.detection.balloon_items[idx]) return;
-        lastJson.detection.balloon_items[idx].tolerance = inpTol.value;
+        const row =
+          lastJson && lastJson.detection && window.BalloonParse && BalloonParse.findBalloonItem
+            ? BalloonParse.findBalloonItem(lastJson.detection, it)
+            : null;
+        if (!row) return;
+        row.tolerance = inpTol.value;
+        if (window.BalloonParse) BalloonParse.enrichBalloonItem(row);
         syncJsonFromTable();
       });
       tdTol.appendChild(inpTol);
@@ -935,49 +1231,19 @@
       const cropUrl = it.crop_preview_base64 || "";
       const saveUrl = it.crop_save_base64 || cropUrl;
       if (cropUrl || saveUrl) {
-        const box = document.createElement("div");
-        box.className = "bbox-crop-box";
-        box.setAttribute("data-detect-class", cls || "unknown");
-        const head = document.createElement("div");
-        head.className = "bbox-crop-box-head";
-        const lab = document.createElement("span");
-        lab.className = "bbox-crop-class";
-        lab.textContent = cls || "—";
-        head.appendChild(lab);
-        const sub = document.createElement("span");
-        sub.className = "bbox-crop-sub";
-        sub.textContent = "Bounding box crop";
-        head.appendChild(sub);
-        box.appendChild(head);
         const visual = document.createElement("div");
         visual.className = "bbox-crop-visual";
-        visual.title =
-          "Exact YOLO bounding box (full image pixels). Save uses full-res crop; thumbnail may be scaled.";
         const img = document.createElement("img");
         img.className = "crop-thumb";
-        img.alt = "Bounding box crop";
+        img.alt = "Crop";
         img.decoding = "async";
         img.loading = "lazy";
         img.onerror = function () {
-          visual.innerHTML = "";
-          visual.classList.add("bbox-crop-error");
-          visual.textContent = "Could not display crop image.";
+          visual.textContent = "";
         };
         img.src = cropUrl || saveUrl;
         visual.appendChild(img);
-        box.appendChild(visual);
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "btn-secondary crop-save";
-        btn.textContent = "Save crop";
-        btn.addEventListener("click", function () {
-          const n = it.balloon_number != null ? String(it.balloon_number) : String(idx + 1);
-          var part = safeCropFilenamePart(cls);
-          var ext = saveUrl && saveUrl.indexOf("image/png") !== -1 ? ".png" : ".jpg";
-          downloadDataUrl(saveUrl, "balloon_crop_" + n + "_" + part + ext);
-        });
-        box.appendChild(btn);
-        stack.appendChild(box);
+        stack.appendChild(visual);
       }
       const inpOth = document.createElement("input");
       inpOth.type = "text";
@@ -985,8 +1251,12 @@
       inpOth.value = others;
       inpOth.placeholder = "empty";
       inpOth.addEventListener("input", function () {
-        if (!lastJson || !lastJson.detection || !lastJson.detection.balloon_items[idx]) return;
-        lastJson.detection.balloon_items[idx].others = inpOth.value;
+        const row =
+          lastJson && lastJson.detection && window.BalloonParse && BalloonParse.findBalloonItem
+            ? BalloonParse.findBalloonItem(lastJson.detection, it)
+            : null;
+        if (!row) return;
+        row.others = inpOth.value;
         syncJsonFromTable();
       });
       stack.appendChild(inpOth);
@@ -1107,18 +1377,75 @@
     drawDetectionsThenBalloons(ctx, sx, det);
   }
 
+  function renderDetectionLegend() {
+    var el = document.getElementById("detectionLegend");
+    if (!el || !window.BalloonParse || !BalloonParse.detectionClassLegendList) return;
+    el.hidden = !showDetectionBoxes;
+    if (!showDetectionBoxes) {
+      el.innerHTML = "";
+      return;
+    }
+    el.innerHTML = "";
+    BalloonParse.detectionClassLegendList().forEach(function (item) {
+      var chip = document.createElement("span");
+      chip.className = "det-legend-chip";
+      var sw = document.createElement("span");
+      sw.className = "det-legend-swatch";
+      sw.style.borderColor = item.stroke;
+      sw.style.background = item.fill;
+      chip.appendChild(sw);
+      chip.appendChild(document.createTextNode(item.label));
+      el.appendChild(chip);
+    });
+    var skip = document.createElement("span");
+    skip.className = "det-legend-chip det-legend-skip";
+    var swSkip = document.createElement("span");
+    swSkip.className = "det-legend-swatch";
+    swSkip.style.borderColor = "#64748b";
+    swSkip.style.background = "rgba(100, 116, 139, 0.12)";
+    skip.appendChild(swSkip);
+    skip.appendChild(document.createTextNode("Hidden duplicate (no balloon)"));
+    el.appendChild(skip);
+  }
+
   function drawDetections(ctx, scale, det) {
-    (det.detections || []).forEach(function (d) {
+    if (showDetectionBoxes === false) return;
+    const dets = det.detections || [];
+    const anns = det.drawing_annotations || [];
+    ctx.save();
+    ctx.setLineDash([]);
+    ctx.font = "10px Segoe UI, system-ui, sans-serif";
+    dets.forEach(function (d, i) {
       const bb = d.bbox;
       if (!bb || bb.length < 4) return;
-      ctx.strokeStyle = "#ffffff";
+      const x1 = bb[0] * scale;
+      const y1 = bb[1] * scale;
+      const w = (bb[2] - bb[0]) * scale;
+      const h = (bb[3] - bb[1]) * scale;
+      const ann = anns[i] || {};
+      const skipped = !!ann.canvas_skip;
+      const cls = (d.class_name || "Dimensions").trim();
+      const pal =
+        window.BalloonParse && BalloonParse.detectionClassPalette
+          ? BalloonParse.detectionClassPalette(cls)
+          : { stroke: "#0891b2", label: cls };
+      if (skipped) {
+        ctx.strokeStyle = "#94a3b8";
+        ctx.setLineDash([4, 3]);
+      } else {
+        ctx.strokeStyle = pal.stroke;
+        ctx.setLineDash([]);
+      }
       ctx.lineWidth = 2;
-      ctx.strokeRect(bb[0] * scale, bb[1] * scale, (bb[2] - bb[0]) * scale, (bb[3] - bb[1]) * scale);
+      ctx.strokeRect(x1 + 0.5, y1 + 0.5, w - 1, h - 1);
     });
+    ctx.restore();
   }
 
   function drawDetectionsThenBalloons(ctx, scale, det) {
-    drawDetections(ctx, scale, det);
+    if (showDetectionBoxes) {
+      drawDetections(ctx, scale, det);
+    }
     if (pendingRectOverlay) {
       const pr = pendingRectOverlay;
       const x1 = Math.min(pr.x1, pr.x2);
@@ -1135,20 +1462,24 @@
   }
 
   function drawBalloons(ctx, scale, det) {
+    if (window.BalloonParse && BalloonParse.syncBalloonItemsFromDetections) {
+      BalloonParse.syncBalloonItemsFromDetections(det);
+    }
+    const entries =
+      window.BalloonParse && BalloonParse.detectionEntriesForCanvas
+        ? BalloonParse.detectionEntriesForCanvas(det)
+        : [];
     ctx.canvas._balloonHitTest = [];
     const overrides = det._balloon_ui_overrides || {};
-    const anns = det.drawing_annotations || [];
-    const BALLOON_DIAMETER_MM = 5;
+    const BALLOON_DIAMETER_MM = 6.5;
     const CSS_DPI = 96;
     const pxPerMm = CSS_DPI / 25.4;
     const r = (BALLOON_DIAMETER_MM * pxPerMm) / 2;
-    const darkRed = "#8b0000";
+    const balloonRed = "#e60000";
     const placed = [];
     const w = ctx.canvas.width;
     const h = ctx.canvas.height;
-    const laneGap = r * 2.6;
-    const laneMargin = r + 8;
-    const laneY = { left: laneMargin, right: laneMargin };
+    const maxDrift = r * 2.5;
     let imageData = null;
     try {
       imageData = ctx.getImageData(0, 0, w, h).data;
@@ -1160,18 +1491,36 @@
       return Math.max(lo, Math.min(hi, v));
     }
 
-    function chooseCenter(ann, x1, y1, x2, y2) {
-      let cx = (x1 + x2) / 2;
-      let cy = (y1 + y2) / 2;
-      const t = ann.TextPos;
-      if (Array.isArray(t) && t.length >= 2 && Number.isFinite(t[0]) && Number.isFinite(t[1])) {
-        cx = t[0] * scale;
-        cy = t[1] * scale;
+    function balloonCenter(ann, x1, y1, x2, y2, dimEntry) {
+      var cx = (x1 + x2) / 2;
+      var gap = Math.max(14, r * 2);
+      var cy = y2 + gap;
+      var side = "below";
+      var tp = ann && ann.TextPos;
+      if (tp && tp.length >= 2 && Number.isFinite(tp[0]) && Number.isFinite(tp[1])) {
+        return {
+          cx: clamp(tp[0] * scale, r + 1, w - r - 1),
+          cy: clamp(tp[1] * scale, r + 1, h - r - 1),
+          side: "legacy",
+        };
       }
-      // Keep the balloon inside canvas bounds.
-      cx = clamp(cx, r + 1, w - r - 1);
-      cy = clamp(cy, r + 1, h - r - 1);
-      return { cx: cx, cy: cy };
+      var bb = [x1 / scale, y1 / scale, x2 / scale, y2 / scale];
+      if (window.BalloonParse && BalloonParse.tightBalloonPlacement) {
+        var pl = BalloonParse.tightBalloonPlacement(
+          bb,
+          gap / scale,
+          dimEntry && dimEntry.dimension_orientation,
+          dimEntry && dimEntry.balloon_side
+        );
+        cx = pl.px * scale;
+        cy = pl.py * scale;
+        side = pl.side || "below";
+      }
+      return {
+        cx: clamp(cx, r + 1, w - r - 1),
+        cy: clamp(cy, r + 1, h - r - 1),
+        side: side,
+      };
     }
 
     function nudgeAway(cx, cy) {
@@ -1234,105 +1583,133 @@
       return pen;
     }
 
-    function chooseBestNearby(cx, cy) {
-      const baseStep = Math.max(10, Math.round(r * 2.2));
+    function chooseTightPosition(px, py, floorCy, floorCx, side) {
       const candidates = [[0, 0]];
-      // Ring search in cardinal + diagonal directions.
-      for (let ring = 1; ring <= 10; ring++) {
-        const d = ring * baseStep;
-        candidates.push([d, 0], [-d, 0], [0, -d], [0, d]);
-        candidates.push([d, -d], [-d, -d], [d, d], [-d, d]);
-        // Slight offsets so we can escape dense note areas.
-        const s = Math.round(d * 0.5);
-        candidates.push([d, s], [d, -s], [-d, s], [-d, -s], [s, d], [-s, d], [s, -d], [-s, -d]);
+      const step = Math.max(6, Math.round(r * 1.1));
+      for (let ring = 1; ring <= 6; ring++) {
+        const d = ring * step;
+        if (side === "right") {
+          candidates.push([d, 0], [d, d], [d, -d], [0, d], [0, -d]);
+        } else {
+          candidates.push([d, 0], [-d, 0], [0, d], [d, d], [-d, d]);
+        }
       }
-      let best = { cx: cx, cy: cy };
+      const minCy = floorCy != null ? floorCy : py;
+      const minCx = floorCx != null ? floorCx : px;
+      let best = {
+        cx: side === "right" ? Math.max(px, minCx) : px,
+        cy: side === "below" ? Math.max(py, minCy) : py,
+      };
       let bestScore = Number.POSITIVE_INFINITY;
       for (let i = 0; i < candidates.length; i++) {
-        const dx = candidates[i][0];
-        const dy = candidates[i][1];
-        const tx = clamp(cx + dx, r + 1, w - r - 1);
-        const ty = clamp(cy + dy, r + 1, h - r - 1);
+        const tx = clamp(
+          px + candidates[i][0],
+          side === "right" ? Math.max(minCx, r + 1) : r + 1,
+          w - r - 1
+        );
+        const ty = clamp(
+          py + candidates[i][1],
+          side === "below" ? Math.max(minCy, r + 1) : r + 1,
+          h - r - 1
+        );
         const ink = getInkRatio(tx, ty);
         const overlap = overlapPenalty(tx, ty);
-        // Prefer white areas first, then avoid overlap, then smaller movement.
-        const dist = Math.hypot(dx, dy);
-        const score = ink * 22 + overlap * 7 + dist * 0.0015;
+        const dist = Math.hypot(tx - px, ty - py);
+        if (dist > maxDrift) continue;
+        const sidePenalty =
+          (side === "below" && ty < minCy ? 50 : 0) +
+          (side === "right" && tx < minCx ? 50 : 0);
+        const score = ink * 18 + overlap * 12 + dist * 0.08 + sidePenalty;
         if (score < bestScore) {
           bestScore = score;
           best = { cx: tx, cy: ty };
         }
-        // Stop early when we find a clean white zone with no overlap.
-        if (ink < 0.015 && overlap < 0.01) break;
+        if (ink < 0.02 && overlap < 0.01) break;
       }
       return best;
     }
 
-    function placeInSideLane(preferred) {
-      const side = preferred.cx > w * 0.55 ? "right" : "left";
-      const cx = side === "right" ? (w - laneMargin) : laneMargin;
-      let cy = Math.max(preferred.cy, laneY[side]);
-      cy = clamp(cy, laneMargin, h - laneMargin);
-      laneY[side] = cy + laneGap;
-      return { cx: cx, cy: cy };
+    function drawBalloonLabel(cx, cy, label) {
+      var fontPx = Math.max(10, Math.min(13, Math.round(r * 0.82)));
+      if (String(label).length > 2) fontPx = Math.max(9, fontPx - 1);
+      ctx.font = fontPx + "px Arial, Segoe UI, system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = balloonRed;
+      ctx.fillText(label, cx, cy);
     }
 
-    function annReadingOrderKey(ann) {
-      const bb = ann.BBox;
-      if (bb && bb.length >= 4) {
-        return { cy: Number(bb[1]), cx: Number(bb[0]) };
-      }
-      if (Array.isArray(ann.TextPos) && ann.TextPos.length >= 2) {
-        return { cy: Number(ann.TextPos[1]), cx: Number(ann.TextPos[0]) };
-      }
-      return { cy: 0, cx: 0 };
+    function entryReadingOrderKey(entry) {
+      const bb = entry.bbox;
+      return { cy: Number(bb[1]), cx: Number(bb[0]) };
     }
 
-    const sorted = anns.slice().sort(function (a, b) {
-      const ka = annReadingOrderKey(a);
-      const kb = annReadingOrderKey(b);
+    const sorted = entries.slice().sort(function (a, b) {
+      const ka = entryReadingOrderKey(a);
+      const kb = entryReadingOrderKey(b);
       if (ka.cy !== kb.cy) return ka.cy - kb.cy;
       return ka.cx - kb.cx;
     });
 
-    sorted.forEach(function (ann) {
-      const bb = ann.BBox;
+    sorted.forEach(function (entry) {
+      const bb = entry.bbox;
       if (!bb || bb.length < 4) return;
       const x1 = bb[0] * scale;
       const y1 = bb[1] * scale;
       const x2 = bb[2] * scale;
       const y2 = bb[3] * scale;
-      const o = overrides[ann.id];
-      let cx;
-      let cy;
+      var label = String(entry.label != null && entry.label !== "" ? entry.label : "");
+      if (!label) label = String((entry.detectionIndex != null ? entry.detectionIndex : 0) + 1);
+      const ann = entry.ann || {};
+      const o =
+        overrides[label] ||
+        overrides[ann.id] ||
+        (ann.display_id != null ? overrides[ann.display_id] : undefined) ||
+        (ann.parent_balloon_number != null ? overrides[ann.parent_balloon_number] : undefined);
+      var cx;
+      var cy;
       if (o && Number.isFinite(o.cx) && Number.isFinite(o.cy)) {
         cx = clamp(o.cx, r + 1, w - r - 1);
         cy = clamp(o.cy, r + 1, h - r - 1);
       } else {
-        const preferred = chooseCenter(ann, x1, y1, x2, y2);
-        const whiteSpot = chooseBestNearby(preferred.cx, preferred.cy);
-        const inkAtWhiteSpot = getInkRatio(whiteSpot.cx, whiteSpot.cy);
-        const laneSpot = inkAtWhiteSpot > 0.055 ? placeInSideLane(preferred) : whiteSpot;
-        const pos = nudgeAway(laneSpot.cx, laneSpot.cy);
-        cx = pos.cx;
-        cy = pos.cy;
+        var center = balloonCenter(ann, x1, y1, x2, y2, entry);
+        var floorCy = y2 + r + 4;
+        var floorCx = x2 + r + 4;
+        if (center.side === "left") floorCx = x1 - r - 4;
+        if (center.side === "above") floorCy = y1 - r - 4;
+        var spot = chooseTightPosition(
+          center.cx,
+          center.cy,
+          floorCy,
+          floorCx,
+          center.side || "below"
+        );
+        var nudged = nudgeAway(spot.cx, spot.cy);
+        cx = nudged.cx;
+        cy = nudged.cy;
       }
 
       ctx.save();
-      ctx.strokeStyle = darkRed;
-      ctx.fillStyle = darkRed;
-      ctx.lineWidth = 2;
+
       ctx.beginPath();
       ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.strokeStyle = balloonRed;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([]);
       ctx.stroke();
-      ctx.font = "bold 8px system-ui, sans-serif";
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      ctx.fillText(String(ann.id != null ? ann.id : ""), cx, cy);
+
+      drawBalloonLabel(cx, cy, label);
       ctx.restore();
       placed.push({ cx: cx, cy: cy });
       const hitR = Math.max(22, r * 2.4);
-      ctx.canvas._balloonHitTest.push({ id: ann.id, cx: cx, cy: cy, r: r, hitR: hitR });
+      ctx.canvas._balloonHitTest.push({
+        id: label,
+        detectionIndex: entry.detectionIndex,
+        cx: cx,
+        cy: cy,
+        r: r,
+        hitR: hitR,
+      });
     });
   }
 
@@ -1546,6 +1923,7 @@
         setModeHint(
           "Balloons are numbered top→bottom, left→right. Create / Edit / Delete, then Save."
         );
+        renderDetectionLegend();
         paintBalloonCanvas();
         showProcessedInputPreview(det);
 
@@ -1621,7 +1999,7 @@
     rows.push([]);
     rows.push(["Extracted text (per balloon)"]);
     rows.push(["balloon_number", "class_name", "confidence", "nominal_value", "tolerance", "others"]);
-    (det.balloon_items || []).forEach(function (it) {
+    displayItemsList(det).forEach(function (it) {
       var oth = it.others != null ? String(it.others) : "";
       if (!oth && (it.detected_text || "").trim()) oth = String(it.detected_text);
       rows.push([
@@ -1703,13 +2081,17 @@
   if (inspectionReport) {
     inspectionReport.addEventListener("click", function () {
       if (!lastJson) return;
+      if (!lastJson.detection || visibleBalloonTotal(lastJson.detection) < 1) {
+        setStatus("Run auto ballooning first.");
+        return;
+      }
       try {
-        sessionStorage.setItem(INSPECTION_STORAGE_KEY, JSON.stringify(lastJson));
+        persistInspectionPayload(lastJson);
       } catch (e) {
         setStatus("Could not open inspection report: " + e);
         return;
       }
-      window.location.href = "/inspection-report";
+      window.open("/inspection-report", "_blank", "noopener,noreferrer");
     });
   }
 
@@ -1792,10 +2174,15 @@
       setBalloonModeButtons();
       setModeHint(
         balloonMode === "delete"
-          ? "Delete: click a red balloon to remove it. Remaining balloons are renumbered. Then Save."
+          ? "Delete: click balloons to remove. Undo delete restores each one (multiple steps). Save to commit."
           : ""
       );
       paintBalloonCanvas();
+    });
+  }
+  if (btnUndoDelete) {
+    btnUndoDelete.addEventListener("click", function () {
+      undoLastBalloonDelete();
     });
   }
   if (btnModeSave) {
@@ -1806,6 +2193,14 @@
 
   if (runBtn) {
   runBtn.addEventListener("click", async function () {
+    if (!authReady && window.BalloonAuth) {
+      setStatus("Starting up… try again in a moment.");
+      return;
+    }
+    if (authEnabled && !getAuthToken()) {
+      window.location.href = "/login";
+      return;
+    }
     if (!lastFile) {
       setStatus("Choose a file first.");
       return;
@@ -1825,28 +2220,42 @@
         headers: _detectHeaders,
         body: fd,
       }, cred));
-      if (authRedirect(r.status)) return;
       const text = await r.text();
       let data;
       try {
         data = JSON.parse(text);
       } catch (e) {
+        data = null;
+      }
+      if (authRedirect(r.status, data)) return;
+      if (!data) {
         setStatus("Non-JSON response HTTP " + r.status);
         if (jsonOut) jsonOut.textContent = text.slice(0, 4000);
         return;
       }
       if (jsonOut) jsonOut.textContent = JSON.stringify(data, null, 2);
       if (!r.ok || !data.ok) {
-        setStatus("Error: " + (data.error || data.detail || "HTTP " + r.status));
+        var errMsg = data.error || data.detail || "HTTP " + r.status;
+        if (typeof errMsg === "object") errMsg = JSON.stringify(errMsg);
+        setStatus("Error: " + errMsg);
         return;
       }
       lastJson = data;
-      renumberBalloonsReadingOrder();
-      renderResults(data);
-      renderResultTable(data);
+      clearDeleteUndoStack();
+      enrichDetectionItems(data.detection);
+      if (window.BalloonParse && BalloonParse.saveInspectionMetaFromDetection) {
+        BalloonParse.saveInspectionMetaFromDetection(data.detection);
+      }
+    applyBalloonNumberingPipeline();
+    renderResults(lastJson);
+    renderResultTable(lastJson);
       setExcelDownloadEnabled(true);
-      setInspectionReportEnabled(true);
-      setStatus("Done.");
+      refreshInspectionReportButton();
+      var detDone = data.detection || {};
+      var visibleN = visibleBalloonTotal(detDone);
+      setStatus(
+        "Done — " + visibleN + " balloon" + (visibleN === 1 ? "" : "s") + "."
+      );
     } catch (e) {
       setStatus("Request failed: " + e);
       if (jsonOut) jsonOut.textContent = String(e);

@@ -4,11 +4,36 @@
   const apiBaseEl = document.getElementById("apiBase");
   if (apiBaseEl) apiBaseEl.textContent = ORIGIN;
 
+  // ── Token bootstrap ──────────────────────────────────────────────────────
+  // If the Dashboard passed ?token=<JWT> in the URL, store it in localStorage
+  // (origin-scoped to 10000) then strip it from the URL so it isn't visible
+  // in the address bar or browser history.
+  (function bootstrapToken() {
+    try {
+      var params = new URLSearchParams(window.location.search);
+      var urlToken = params.get("token");
+      if (urlToken) {
+        localStorage.setItem("balloon_token", urlToken);
+        params.delete("token");
+        var clean = window.location.pathname +
+          (params.toString() ? "?" + params.toString() : "") +
+          window.location.hash;
+        history.replaceState(null, "", clean);
+      }
+    } catch (e) {
+      console.warn("[auth] Token bootstrap failed:", e);
+    }
+  })();
+
+  /** Returns the JWT stored for this origin, or null if not logged in. */
+  function getAuthToken() {
+    return localStorage.getItem("balloon_token") || null;
+  }
+
   const fileInput = document.getElementById("file");
   const runBtn = document.getElementById("runBtn");
   const statusEl = document.getElementById("status");
   const panelInput = document.getElementById("panelInput");
-  const panelDetect = document.getElementById("panelDetect");
   const panelBalloon = document.getElementById("panelBalloon");
   const jsonOut = document.getElementById("jsonOut");
   const resultBody = document.getElementById("resultBody");
@@ -17,30 +42,702 @@
   const downloadExcel = document.getElementById("downloadExcel");
   const inspectionReport = document.getElementById("inspectionReport");
   const INSPECTION_STORAGE_KEY = "smorx_inspection_payload";
+  const INSPECTION_META_KEY = "smorx_inspection_meta";
+
+  function enrichDetectionItems(det) {
+    if (!det || !det.balloon_items || !window.BalloonParse) return;
+    det.balloon_items.forEach(function (it) {
+      BalloonParse.enrichBalloonItem(it);
+    });
+  }
+
+  /** Keep server tblr numbering (AutoBallooning_drawing3 style). Only fix nX table rows + drawing ids. */
+  function applyBalloonNumberingPipeline(optDet) {
+    const det = optDet || (lastJson && lastJson.detection);
+    if (!det) return;
+    if (window.BalloonParse && BalloonParse.ensureDrawingAnnotations) {
+      BalloonParse.ensureDrawingAnnotations(det);
+    }
+    if (window.BalloonParse && BalloonParse.expandMultiplierBalloons) {
+      BalloonParse.expandMultiplierBalloons(det);
+    } else if (window.BalloonParse && BalloonParse.repairMultiplierDrawingAnnotations) {
+      BalloonParse.repairMultiplierDrawingAnnotations(det);
+    }
+  }
+
+  function persistInspectionPayload(data) {
+    if (!data) return;
+    enrichDetectionItems(data.detection);
+    if (data.detection) applyBalloonNumberingPipeline(data.detection);
+    if (window.BalloonParse && BalloonParse.saveInspectionMetaFromDetection && data.detection) {
+      BalloonParse.saveInspectionMetaFromDetection(data.detection);
+    }
+    if (window.InspectionStore) {
+      if (InspectionStore.setBalloonAppUrl) {
+        InspectionStore.setBalloonAppUrl(window.location.origin + "/app");
+      }
+      if (InspectionStore.setDashboardUrl) {
+        InspectionStore.setDashboardUrl("http://localhost:3000/dashboard");
+      }
+    }
+    if (window.InspectionStore && InspectionStore.setPayload) {
+      InspectionStore.setPayload(data);
+    } else {
+      localStorage.setItem(INSPECTION_STORAGE_KEY, JSON.stringify(data));
+      try {
+        sessionStorage.setItem(INSPECTION_STORAGE_KEY, JSON.stringify(data));
+      } catch (e) { /* ignore */ }
+    }
+  }
   const adminLink = document.getElementById("adminLink");
-  const logoutBtn = document.getElementById("logoutBtn");
+  const dashboardBtn = document.getElementById("dashboardBtn");
 
   let lastFile = null;
   let lastJson = null;
   let lastBalloonCanvas = null;
-  let lastInputPreviewUrl = null;
+  let balloonImageCache = null;
+  /** Blob URL for PDF iframe preview — revoked when replaced or reset */
+  let inputPdfPreviewUrl = null;
+  /** @type {Record<number, { cx: number, cy: number }>} canvas-space coords for dragged balloons */
+  let balloonUiOverrides = {};
+  /** @type {null | 'create' | 'edit' | 'delete'} */
+  let balloonMode = null;
+  /** Drag state must live outside per-canvas closures so document-level move/up work after repaint. */
+  let activeBalloonDrag = null;
+  /** @type {null | { x1: number, y1: number, x2: number, y2: number }} canvas px */
+  let pendingRectOverlay = null;
 
-  function revokeInputPreviewUrl() {
-    if (lastInputPreviewUrl) {
-      URL.revokeObjectURL(lastInputPreviewUrl);
-      lastInputPreviewUrl = null;
+  const btnModeCreate = document.getElementById("btnModeCreate");
+  const btnModeEdit = document.getElementById("btnModeEdit");
+  const btnModeDelete = document.getElementById("btnModeDelete");
+  const btnModeSave = document.getElementById("btnModeSave");
+  const modeHintEl = document.getElementById("modeHint");
+  const btnBalloonMenu = document.getElementById("btnBalloonMenu");
+  const balloonQuickPanel = document.getElementById("balloonQuickPanel");
+  const quickBalloonBody = document.getElementById("quickBalloonBody");
+  const btnCloseQuickPanel = document.getElementById("btnCloseQuickPanel");
+  const btnQuickSave = document.getElementById("btnQuickSave");
+  const quickCropViewModal = document.getElementById("quickCropViewModal");
+  const quickCropViewImg = document.getElementById("quickCropViewImg");
+  const btnCloseCropModal = document.getElementById("btnCloseCropModal");
+  const quickCropModalBackdrop = document.getElementById("quickCropModalBackdrop");
+  /** Quick panel: moved to body + drag */
+  let quickPanelOnBody = false;
+  let quickPanelSavedPos = null;
+  let quickPanelDrag = null;
+
+  function getCanvasScale(det) {
+    const iw = Number(det && det.width) || 1;
+    const maxW = Math.min(1100, iw);
+    return maxW / iw;
+  }
+
+  function canvasRectToDetectionBBox(cx1, cy1, cx2, cy2, det) {
+    const sx = getCanvasScale(det);
+    let x1 = Math.round(Math.min(cx1, cx2) / sx);
+    let y1 = Math.round(Math.min(cy1, cy2) / sx);
+    let x2 = Math.round(Math.max(cx1, cx2) / sx);
+    let y2 = Math.round(Math.max(cy1, cy2) / sx);
+    const iw = Number(det.width) || 1;
+    const ih = Number(det.height) || 1;
+    x1 = Math.max(0, Math.min(iw - 1, x1));
+    y1 = Math.max(0, Math.min(ih - 1, y1));
+    x2 = Math.max(x1 + 1, Math.min(iw, x2));
+    y2 = Math.max(y1 + 1, Math.min(ih, y2));
+    return [x1, y1, x2, y2];
+  }
+
+  function cropCanvasRegion(canvas, cx1, cy1, cx2, cy2) {
+    const w = Math.max(1, Math.round(Math.abs(cx2 - cx1)));
+    const h = Math.max(1, Math.round(Math.abs(cy2 - cy1)));
+    const lx = Math.min(cx1, cx2);
+    const ly = Math.min(cy1, cy2);
+    const c = document.createElement("canvas");
+    c.width = w;
+    c.height = h;
+    try {
+      c.getContext("2d").drawImage(canvas, lx, ly, w, h, 0, 0, w, h);
+    } catch (err) {
+      return { preview: "", save: "" };
     }
+    const u = c.toDataURL("image/jpeg", 0.92);
+    return { preview: u, save: u };
+  }
+
+  function setBalloonModeButtons() {
+    if (btnModeCreate) btnModeCreate.classList.toggle("mode-active", balloonMode === "create");
+    if (btnModeEdit) btnModeEdit.classList.toggle("mode-active", balloonMode === "edit");
+    if (btnModeDelete) btnModeDelete.classList.toggle("mode-active", balloonMode === "delete");
+  }
+
+  function setModeHint(text) {
+    if (modeHintEl) modeHintEl.textContent = text || "";
+  }
+
+  function setBalloonToolsEnabled(on) {
+    if (btnModeCreate) btnModeCreate.disabled = !on;
+    if (btnModeEdit) btnModeEdit.disabled = !on;
+    if (btnModeDelete) btnModeDelete.disabled = !on;
+    if (btnModeSave) btnModeSave.disabled = !on;
+    if (btnBalloonMenu) btnBalloonMenu.disabled = !on;
+  }
+
+  function ensureQuickPanelOnBody() {
+    if (quickPanelOnBody || !balloonQuickPanel) return;
+    document.body.appendChild(balloonQuickPanel);
+    quickPanelOnBody = true;
+    const head = balloonQuickPanel.querySelector(".balloon-quick-panel-head");
+    if (head && !head.dataset.dragInit) {
+      head.dataset.dragInit = "1";
+      head.addEventListener("mousedown", onQuickPanelHeadDragStart);
+    }
+  }
+
+  function placeQuickPanelForOpen() {
+    if (!balloonQuickPanel || !btnBalloonMenu) return;
+    balloonQuickPanel.style.position = "fixed";
+    balloonQuickPanel.style.right = "auto";
+    balloonQuickPanel.style.bottom = "auto";
+    if (quickPanelSavedPos) {
+      balloonQuickPanel.style.left = quickPanelSavedPos.left + "px";
+      balloonQuickPanel.style.top = quickPanelSavedPos.top + "px";
+      return;
+    }
+    const r = btnBalloonMenu.getBoundingClientRect();
+    const estW = Math.min(window.innerWidth * 0.96, 832);
+    const estH = 320;
+    let left = r.right - estW;
+    left = Math.max(8, Math.min(left, window.innerWidth - estW - 8));
+    let top = r.bottom + 8;
+    if (top + estH > window.innerHeight - 8) {
+      top = Math.max(8, r.top - estH - 8);
+    }
+    balloonQuickPanel.style.left = left + "px";
+    balloonQuickPanel.style.top = top + "px";
+  }
+
+  function onQuickPanelHeadDragStart(e) {
+    if (!balloonQuickPanel || balloonQuickPanel.hidden) return;
+    if (e.target.closest && e.target.closest(".btn-close-quick")) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = balloonQuickPanel.getBoundingClientRect();
+    quickPanelDrag = {
+      startX: e.clientX,
+      startY: e.clientY,
+      origLeft: rect.left,
+      origTop: rect.top,
+    };
+    document.body.style.userSelect = "none";
+  }
+
+  function onQuickPanelDragMove(e) {
+    if (!quickPanelDrag || !balloonQuickPanel) return;
+    e.preventDefault();
+    const dx = e.clientX - quickPanelDrag.startX;
+    const dy = e.clientY - quickPanelDrag.startY;
+    let nl = quickPanelDrag.origLeft + dx;
+    let nt = quickPanelDrag.origTop + dy;
+    const w = balloonQuickPanel.offsetWidth;
+    const h = balloonQuickPanel.offsetHeight;
+    nl = Math.max(0, Math.min(nl, window.innerWidth - w));
+    nt = Math.max(0, Math.min(nt, window.innerHeight - h));
+    balloonQuickPanel.style.left = nl + "px";
+    balloonQuickPanel.style.top = nt + "px";
+    balloonQuickPanel.style.right = "auto";
+  }
+
+  function onQuickPanelDragEnd() {
+    document.body.style.userSelect = "";
+    if (!quickPanelDrag || !balloonQuickPanel) {
+      quickPanelDrag = null;
+      return;
+    }
+    quickPanelDrag = null;
+    const r = balloonQuickPanel.getBoundingClientRect();
+    quickPanelSavedPos = { left: r.left, top: r.top };
+  }
+
+  document.addEventListener("mousemove", onQuickPanelDragMove);
+  document.addEventListener("mouseup", onQuickPanelDragEnd);
+
+  function openQuickCropModal(dataUrl) {
+    if (!quickCropViewModal || !quickCropViewImg) return;
+    if (!dataUrl) return;
+    quickCropViewImg.src = dataUrl;
+    quickCropViewModal.hidden = false;
+  }
+
+  function closeQuickCropModal() {
+    if (!quickCropViewModal || !quickCropViewImg) return;
+    quickCropViewModal.hidden = true;
+    quickCropViewImg.removeAttribute("src");
+  }
+
+  function setQuickPanelOpen(open) {
+    if (!balloonQuickPanel || !btnBalloonMenu) return;
+    if (open) {
+      ensureQuickPanelOnBody();
+      buildQuickTableFromDetection();
+      placeQuickPanelForOpen();
+      balloonQuickPanel.hidden = false;
+      btnBalloonMenu.setAttribute("aria-expanded", "true");
+    } else {
+      balloonQuickPanel.hidden = true;
+      btnBalloonMenu.setAttribute("aria-expanded", "false");
+    }
+  }
+
+  function appendQuickRowFromItem(it) {
+    if (!quickBalloonBody) return;
+    const tr = document.createElement("tr");
+    function mk(cls, val, ph) {
+      const inp = document.createElement("input");
+      inp.type = "text";
+      inp.className = "table-text-input " + cls;
+      inp.value = val != null ? String(val) : "";
+      inp.placeholder = ph || "";
+      return inp;
+    }
+    const td1 = document.createElement("td");
+    td1.appendChild(mk("qb-num", it.balloon_number, "#"));
+    const td2 = document.createElement("td");
+    td2.appendChild(mk("qb-class", it.class_name, "Classes"));
+    const td3 = document.createElement("td");
+    td3.appendChild(mk("qb-nom", it.nominal_value, "Nominal"));
+    const td4 = document.createElement("td");
+    td4.appendChild(mk("qb-tol", it.tolerance, "Tol"));
+    const td5 = document.createElement("td");
+    td5.appendChild(mk("qb-oth", it.others, "others"));
+    const pv = it.crop_preview_base64 || "";
+    const sv = it.crop_save_base64 || it.crop_preview_base64 || "";
+    tr._qbCropPreview = pv;
+    tr._qbCropSave = sv;
+    const fullViewUrl = sv || pv;
+    const tdCrop = document.createElement("td");
+    tdCrop.className = "qb-col-crop";
+    const cropWrap = document.createElement("div");
+    cropWrap.className = "qb-crop-cell";
+    if (pv || sv) {
+      const thumbSrc = pv || sv;
+      const im = document.createElement("img");
+      im.className = "qb-crop-thumb";
+      im.src = thumbSrc;
+      im.alt = "Crop";
+      im.title = "Click to view full size";
+      im.style.cursor = fullViewUrl ? "pointer" : "default";
+      im.addEventListener("mousedown", function (e) {
+        e.stopPropagation();
+      });
+      im.addEventListener("click", function (e) {
+        e.stopPropagation();
+        e.preventDefault();
+        if (fullViewUrl) openQuickCropModal(fullViewUrl);
+      });
+      cropWrap.appendChild(im);
+    } else {
+      const none = document.createElement("span");
+      none.className = "qb-crop-none";
+      none.textContent = "—";
+      cropWrap.appendChild(none);
+    }
+    const btnView = document.createElement("button");
+    btnView.type = "button";
+    btnView.className = "btn-secondary btn-mini";
+    btnView.textContent = "View";
+    btnView.disabled = !fullViewUrl;
+    btnView.addEventListener("mousedown", function (e) {
+      e.stopPropagation();
+    });
+    btnView.addEventListener("click", function (e) {
+      e.stopPropagation();
+      e.preventDefault();
+      if (fullViewUrl) openQuickCropModal(fullViewUrl);
+    });
+    cropWrap.appendChild(btnView);
+    tdCrop.appendChild(cropWrap);
+    const tdAct = document.createElement("td");
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "btn-secondary btn-mini";
+    del.textContent = "Delete";
+    del.addEventListener("mousedown", function (e) {
+      e.stopPropagation();
+    });
+    del.addEventListener("click", function (e) {
+      e.stopPropagation();
+      e.preventDefault();
+      tr.remove();
+    });
+    tdAct.appendChild(del);
+    tr.appendChild(td1);
+    tr.appendChild(td2);
+    tr.appendChild(td3);
+    tr.appendChild(td4);
+    tr.appendChild(td5);
+    tr.appendChild(tdCrop);
+    tr.appendChild(tdAct);
+    quickBalloonBody.appendChild(tr);
+  }
+
+  function buildQuickTableFromDetection() {
+    if (!quickBalloonBody) return;
+    quickBalloonBody.innerHTML = "";
+    const items = (lastJson && lastJson.detection && lastJson.detection.balloon_items) || [];
+    items.forEach(function (it) {
+      appendQuickRowFromItem(it);
+    });
+  }
+
+  function applyQuickTableToDetection() {
+    if (!lastJson || !lastJson.detection || !quickBalloonBody) return;
+    const det = lastJson.detection;
+    const rows = quickBalloonBody.querySelectorAll("tr");
+    const oldItems = det.balloon_items || [];
+    const oldDets = det.detections || [];
+    const oldAnns = det.drawing_annotations || [];
+    const w = Number(det.width) || 1000;
+    const h = Number(det.height) || 1000;
+    const cx = Math.floor(w / 2);
+    const cy = Math.floor(h / 2);
+    const half = 48;
+    const stubBbox = [
+      Math.max(0, cx - half),
+      Math.max(0, cy - half),
+      Math.min(w, cx + half),
+      Math.min(h, cy + half),
+    ];
+
+    if (rows.length === 0) {
+      det.balloon_items = [];
+      det.detections = [];
+      det.drawing_annotations = [];
+      det.count = 0;
+      balloonUiOverrides = {};
+      det.balloon_ui_overrides = {};
+      renderResultTable(lastJson);
+      paintBalloonCanvas();
+      syncJsonFromTable();
+      setStatus("Quick table saved — list cleared.");
+      setQuickPanelOpen(false);
+      return;
+    }
+
+    const newItems = [];
+    const newDets = [];
+    const newAnns = [];
+
+    rows.forEach(function (tr, i) {
+      const nRaw = tr.querySelector(".qb-num").value.trim();
+      const numParsed = parseInt(nRaw, 10);
+      const balloonNum = Number.isFinite(numParsed) && numParsed > 0 ? numParsed : i + 1;
+      const cls = tr.querySelector(".qb-class").value.trim() || "Manual";
+      const nom = tr.querySelector(".qb-nom").value;
+      const tol = tr.querySelector(".qb-tol").value;
+      const oth = tr.querySelector(".qb-oth").value;
+
+      const base = Object.assign({}, oldItems[i] || {});
+      const merged = Object.assign(base, {
+        balloon_number: balloonNum,
+        class_name: cls,
+        confidence: base.confidence != null ? base.confidence : 1,
+        nominal_value: nom,
+        tolerance: tol,
+        others: oth,
+      });
+      if (tr._qbCropPreview !== undefined) merged.crop_preview_base64 = tr._qbCropPreview;
+      if (tr._qbCropSave !== undefined) merged.crop_save_base64 = tr._qbCropSave;
+      newItems.push(merged);
+
+      if (i < oldDets.length) {
+        const d = Object.assign({}, oldDets[i]);
+        d.class_name = cls;
+        newDets.push(d);
+        const ann = Object.assign({}, oldAnns[i]);
+        ann.id = balloonNum;
+        ann.AnnotationType = cls;
+        newAnns.push(ann);
+      } else {
+        newDets.push({
+          class_name: cls,
+          confidence: 1,
+          bbox: stubBbox.slice(),
+          _manual: true,
+          _fromQuickTable: true,
+        });
+        newAnns.push({
+          id: balloonNum,
+          AnnotationType: cls,
+          BBox: stubBbox.slice(),
+          TextPos: [(stubBbox[0] + stubBbox[2]) / 2, (stubBbox[1] + stubBbox[3]) / 2],
+        });
+      }
+    });
+
+    det.balloon_items = newItems;
+    det.detections = newDets;
+    det.drawing_annotations = newAnns;
+    det.count = newDets.length;
+
+    const nextOv = {};
+    for (let i = 0; i < newAnns.length; i++) {
+      const bid = newAnns[i].id;
+      if (balloonUiOverrides[bid]) {
+        nextOv[bid] = balloonUiOverrides[bid];
+      }
+    }
+    balloonUiOverrides = nextOv;
+    det.balloon_ui_overrides = Object.assign({}, nextOv);
+
+    renderResultTable(lastJson);
+    paintBalloonCanvas();
+    syncJsonFromTable();
+    setStatus("Quick table saved — same values appear in Detected details below.");
+    setQuickPanelOpen(false);
+  }
+
+  function applyBalloonSave() {
+    if (!lastJson || !lastJson.detection) return;
+    const det = lastJson.detection;
+    const sx = getCanvasScale(det);
+    const anns = det.drawing_annotations || [];
+    for (let i = 0; i < anns.length; i++) {
+      const ann = anns[i];
+      const o = balloonUiOverrides[ann.id];
+      if (o && Number.isFinite(o.cx) && Number.isFinite(o.cy)) {
+        ann.TextPos = [o.cx / sx, o.cy / sx];
+      }
+    }
+    det.balloon_ui_overrides = Object.assign({}, balloonUiOverrides);
+    det.count = (det.detections || []).length;
+    syncJsonFromTable();
+    renderResultTable(lastJson);
+    paintBalloonCanvas();
+    setStatus("Saved — JSON, table, and canvas updated.");
+    setModeHint("Saved. Continue with Create / Edit, or Save again after more changes.");
+  }
+
+  function bboxesRoughlyEqual(a, b) {
+    if (!a || !b || a.length < 4 || b.length < 4) return false;
+    for (let i = 0; i < 4; i++) {
+      if (Math.abs(Number(a[i]) - Number(b[i])) > 1.5) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Same vision LLM extract as automatic detection — fills nominal / tolerance / others for a manual box.
+   */
+  function fetchExtractForManualBalloon(bboxRef) {
+    const det = lastJson && lastJson.detection;
+    if (!det) return;
+    const dets = det.detections || [];
+    const items = det.balloon_items || [];
+    let idx = -1;
+    for (let i = 0; i < dets.length; i++) {
+      if (!dets[i]._manual) continue;
+      if (bboxesRoughlyEqual(dets[i].bbox, bboxRef)) {
+        idx = i;
+        break;
+      }
+    }
+    if (idx < 0 || idx >= items.length) return;
+    const it = items[idx];
+    const imgData = it.crop_save_base64 || it.crop_preview_base64;
+    if (!imgData) return;
+    setStatus("Extracting text from manual crop…");
+    fetch(ORIGIN + "/api/v1/extract-balloon-text", {
+      method: "POST",
+      headers: (function () {
+        var h = { "Content-Type": "application/json" };
+        var t = getAuthToken(); if (t) h["Authorization"] = "Bearer " + t;
+        return h;
+      })(),
+      body: JSON.stringify({ crop_jpeg_base64: imgData, class_name: "Manual" }),
+      credentials: "same-origin",
+    })
+      .then(function (r) {
+        if (authRedirect(r.status)) return null;
+        return r.json();
+      })
+      .then(function (j) {
+        if (!j || !j.ok || !j.extract) {
+          setStatus("Manual balloon added (text extract unavailable). Save to keep the box.");
+          return;
+        }
+        const ex = j.extract;
+        it.nominal_value = ex.nominal_value != null ? String(ex.nominal_value) : "";
+        it.tolerance = ex.tolerance != null ? String(ex.tolerance) : "";
+        it.others = ex.others != null ? String(ex.others) : "";
+        applyBalloonNumberingPipeline();
+        syncJsonFromTable();
+        renderResultTable(lastJson);
+        paintBalloonCanvas();
+        setStatus("Manual balloon: nominal / tolerance filled like auto-detect.");
+      })
+      .catch(function () {
+        setStatus("Manual balloon added (extract request failed). Save to keep the box.");
+      });
+  }
+
+  function addManualDetectionFromRect(canvas, cx1, cy1, cx2, cy2) {
+    if (!lastJson || !lastJson.detection) return;
+    const det = lastJson.detection;
+    const bbox = canvasRectToDetectionBBox(cx1, cy1, cx2, cy2, det);
+    if (bbox[2] - bbox[0] < 4 || bbox[3] - bbox[1] < 4) return;
+    const crops = cropCanvasRegion(canvas, cx1, cy1, cx2, cy2);
+    const dets = det.detections || [];
+    const annId = dets.length + 1;
+    dets.push({
+      class_name: "Manual",
+      confidence: 1,
+      bbox: bbox,
+      _manual: true,
+    });
+    det.detections = dets;
+    const anns = det.drawing_annotations || [];
+    anns.push({
+      id: annId,
+      AnnotationType: "Manual",
+      BBox: bbox.slice(),
+      TextPos: [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2],
+    });
+    det.drawing_annotations = anns;
+    const items = det.balloon_items || [];
+    items.push({
+      balloon_number: annId,
+      class_name: "Manual",
+      confidence: 1,
+      nominal_value: "",
+      tolerance: "",
+      others: "",
+      bbox_pixels: bbox.slice(),
+      crop_preview_base64: crops.preview,
+      crop_save_base64: crops.save,
+      manual: true,
+    });
+    det.balloon_items = items;
+    det.count = dets.length;
+    const bboxForExtract = bbox.slice();
+    renumberBalloonsReadingOrder();
+    syncJsonFromTable();
+    renderResultTable(lastJson);
+    paintBalloonCanvas();
+    setStatus("Balloon added. Numbers follow top→bottom, left→right. Use Save to commit.");
+    fetchExtractForManualBalloon(bboxForExtract);
+  }
+
+  /**
+   * Sort by bbox center: top→bottom, then left→right. Assign ids 1…n (same as backend tblr rules).
+   */
+  function renumberBalloonsReadingOrder(optDet) {
+    const det = optDet || (lastJson && lastJson.detection);
+    if (!det) return;
+    if (window.BalloonParse && BalloonParse.ensureDrawingAnnotations) {
+      BalloonParse.ensureDrawingAnnotations(det);
+    }
+    const dets = det.detections || [];
+    const anns = det.drawing_annotations || [];
+    const n = Math.min(dets.length, anns.length);
+    if (n === 0) {
+      if (dets.length === 0 && anns.length === 0) {
+        det.balloon_items = det.balloon_items || [];
+        det.count = 0;
+        balloonUiOverrides = {};
+        det.balloon_ui_overrides = {};
+      }
+      return;
+    }
+
+    function bboxReadingOrderKey(di) {
+      let bb = dets[di] && dets[di].bbox;
+      if (!bb || bb.length < 4) {
+        const a = anns[di];
+        bb = a && (a.BBox || a.bbox);
+      }
+      if (!bb || bb.length < 4) return [1e30, 1e30];
+      return [Number(bb[1]), Number(bb[0])];
+    }
+
+    const indices = [];
+    for (let i = 0; i < n; i++) indices.push(i);
+    indices.sort(function (ia, ib) {
+      const ka = bboxReadingOrderKey(ia);
+      const kb = bboxReadingOrderKey(ib);
+      if (ka[0] !== kb[0]) return ka[0] - kb[0];
+      if (ka[1] !== kb[1]) return ka[1] - kb[1];
+      return ia - ib;
+    });
+
+    const mergedOv = Object.assign({}, det.balloon_ui_overrides || {}, balloonUiOverrides);
+    const detIndexToNewId = {};
+    const newDets = dets.slice();
+    const newAnns = anns.slice();
+    const newOverrides = Object.assign({}, mergedOv);
+
+    for (let j = 0; j < indices.length; j++) {
+      const oi = indices[j];
+      const newId = j + 1;
+      const oldId = anns[oi].id;
+      detIndexToNewId[oi] = newId;
+      const ann = Object.assign({}, anns[oi]);
+      ann.id = newId;
+      delete ann.canvas_skip;
+      delete ann.display_id;
+      delete ann.report_only;
+      newAnns[oi] = ann;
+      newDets[oi] = dets[oi];
+      if (mergedOv[oldId] && Number.isFinite(mergedOv[oldId].cx) && Number.isFinite(mergedOv[oldId].cy)) {
+        newOverrides[newId] = mergedOv[oldId];
+        delete newOverrides[oldId];
+      }
+    }
+
+    det.detections = newDets;
+    det.drawing_annotations = newAnns;
+    det.count = newDets.length;
+    balloonUiOverrides = newOverrides;
+    det.balloon_ui_overrides = Object.assign({}, newOverrides);
+
+    if (window.BalloonParse && BalloonParse.syncBalloonItemsFromDetectionIds) {
+      BalloonParse.syncBalloonItemsFromDetectionIds(det, detIndexToNewId);
+    }
+  }
+
+  function deleteBalloonById(balloonId) {
+    if (!lastJson || !lastJson.detection) return false;
+    const det = lastJson.detection;
+    const anns = det.drawing_annotations || [];
+    const idx = anns.findIndex(function (a) {
+      return Number(a.id) === Number(balloonId);
+    });
+    if (idx < 0) return false;
+
+    const dets = det.detections || [];
+    const items = det.balloon_items || [];
+
+    if (idx < dets.length) dets.splice(idx, 1);
+    anns.splice(idx, 1);
+    if (idx < items.length) items.splice(idx, 1);
+
+    det.detections = dets;
+    det.drawing_annotations = anns;
+    det.balloon_items = items;
+
+    applyBalloonNumberingPipeline();
+    syncJsonFromTable();
+    renderResultTable(lastJson);
+    paintBalloonCanvas();
+    setStatus("Removed balloon. Numbers follow top→bottom, left→right. Click Save to commit.");
+    return true;
   }
 
   function setInputDownloadEnabled(on) {
     if (downloadInput) downloadInput.disabled = !on;
   }
 
-  const balloonSave = document.getElementById("balloonSave");
-
   function setBalloonDownloadEnabled(on) {
     if (downloadBalloon) downloadBalloon.disabled = !on;
-    if (balloonSave) balloonSave.disabled = !on;
   }
 
   function setExcelDownloadEnabled(on) {
@@ -54,7 +751,56 @@
   }
 
   function setStatus(t) {
-    statusEl.textContent = t || "";
+    if (statusEl) statusEl.textContent = t || "";
+  }
+
+  // ── Toast notifications ──────────────────────────────────────────────────
+  function showToast(msg, type) {
+    // type: 'error' | 'success' | 'info'
+    var existing = document.getElementById("_dashToast");
+    if (existing) existing.remove();
+    var toast = document.createElement("div");
+    toast.id = "_dashToast";
+    var bg = type === "error" ? "#c0392b" : type === "success" ? "#1a6640" : "#1a3a5c";
+    toast.style.cssText = [
+      "position:fixed", "top:1.25rem", "left:50%", "transform:translateX(-50%)",
+      "background:" + bg, "color:#fff", "padding:0.75rem 1.4rem",
+      "border-radius:8px", "font-size:0.9rem", "font-weight:600",
+      "box-shadow:0 4px 18px rgba(0,0,0,0.45)", "z-index:99999",
+      "max-width:90vw", "text-align:center", "pointer-events:none",
+    ].join(";");
+    toast.textContent = msg;
+    document.body.appendChild(toast);
+    setTimeout(function () { if (toast.parentNode) toast.remove(); }, 4000);
+  }
+
+  // ── Full session reset (reused by file-change and dashboard redirect) ────
+  function resetSession() {
+    lastFile = null;
+    lastJson = null;
+    lastBalloonCanvas = null;
+    balloonImageCache = null;
+    balloonUiOverrides = {};
+    balloonMode = null;
+    pendingRectOverlay = null;
+    detachBalloonDragListeners();
+    activeBalloonDrag = null;
+    setBalloonModeButtons();
+    setBalloonToolsEnabled(false);
+    setModeHint("Run auto ballooning first. Then use Create (draw box), Edit (drag balloons), Save (apply everywhere).");
+    if (jsonOut) jsonOut.textContent = "{}";
+    setBalloonDownloadEnabled(false);
+    setExcelDownloadEnabled(false);
+    setInspectionReportEnabled(false);
+    if (resultBody) resultBody.innerHTML = "<tr><td colspan=\"5\">Run auto ballooning to see extracted values.</td></tr>";
+    clearPanel(panelBalloon, "Run auto ballooning to see balloons here.");
+    clearPanel(panelInput);
+    setInputDownloadEnabled(false);
+    if (fileInput) { try { fileInput.value = ""; } catch (_) {} }
+    revokeInputPdfPreview();
+    quickPanelSavedPos = null;
+    setQuickPanelOpen(false);
+    setStatus("");
   }
 
   function authRedirect(status) {
@@ -69,11 +815,99 @@
     return false;
   }
 
-  if (logoutBtn) {
-    logoutBtn.addEventListener("click", function () {
-      fetch(ORIGIN + "/api/auth/logout", Object.assign({ method: "POST" }, cred)).then(function () {
-        window.location.href = "/login";
-      });
+  if (dashboardBtn) {
+    dashboardBtn.addEventListener("click", async function () {
+      const token = getAuthToken();
+
+      if (!token) {
+        showToast("You are not logged in. Please log in first.", "error");
+        return;
+      }
+
+      // Capture the annotated canvas as a JPEG base64 thumbnail
+      let previewB64 = null;
+      if (lastBalloonCanvas) {
+        try {
+          previewB64 = lastBalloonCanvas.toDataURL("image/jpeg", 0.7);
+        } catch (e) {
+          console.warn("[dashboard] Could not capture canvas preview:", e);
+        }
+      }
+
+      // Detect which JSON layout the pipeline returned
+      // Older layout: lastJson.detection.balloon_items
+      // Newer layout: lastJson.balloon_items
+      const det = (lastJson && lastJson.detection) ? lastJson.detection : lastJson;
+
+      function stripCrop(item) {
+        const c = Object.assign({}, item);
+        delete c.crop_save_base64;
+        delete c.crop_preview_base64;  // large base64 thumbnail — not needed in DB
+        return c;
+      }
+
+      // table_data — flat list used for the balloon items table
+      let tableData = null;
+      if (det && det.balloon_items) {
+        tableData = det.balloon_items.map(stripCrop);
+      }
+
+      // balloon_data — full detection payload (crops stripped)
+      let balloonData = null;
+      if (det) {
+        balloonData = Object.assign({}, det);
+        if (balloonData.balloon_items) {
+          balloonData.balloon_items = balloonData.balloon_items.map(stripCrop);
+        }
+      }
+
+      const filename = (lastFile && lastFile.name) ? lastFile.name : "drawing";
+
+      if (balloonData) {
+        // Data exists — try to save, but never block navigation on failure
+        dashboardBtn.disabled = true;
+        dashboardBtn.textContent = "Saving…";
+
+        try {
+          const resp = await fetch(ORIGIN + "/activities/save", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": "Bearer " + token,
+            },
+            body: JSON.stringify({
+              filename: filename,
+              drawing_preview_b64: previewB64,
+              extracted_data: balloonData,
+              excel_data: tableData,
+            }),
+          });
+
+          if (resp.ok) {
+            showToast("Session saved successfully", "success");
+          } else {
+            let detail = "Save failed (HTTP " + resp.status + ").";
+            try { const j = await resp.json(); detail = j.detail || detail; } catch (_) {}
+            console.error("[dashboard] Save error:", detail);
+          }
+        } catch (e) {
+          console.error("[dashboard] Network error — could not save:", e);
+        }
+      } else {
+        showToast("No data to save — redirecting to dashboard", "info");
+      }
+
+      if (window.InspectionStore && InspectionStore.setDashboardUrl) {
+        InspectionStore.setDashboardUrl("http://localhost:3000/dashboard");
+      }
+      resetSession();
+      setTimeout(function () {
+        var dash =
+          window.InspectionStore && InspectionStore.getDashboardUrl
+            ? InspectionStore.getDashboardUrl()
+            : "http://localhost:3000/dashboard";
+        window.location.href = dash;
+      }, 800);
     });
   }
 
@@ -88,28 +922,153 @@
     })
     .catch(function () {});
 
+  function syncJsonFromTable() {
+    if (jsonOut && lastJson) jsonOut.textContent = JSON.stringify(lastJson, null, 2);
+  }
+
+  function downloadDataUrl(dataUrl, filename) {
+    const a = document.createElement("a");
+    a.href = dataUrl;
+    a.download = filename;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }
+
+  function safeCropFilenamePart(className) {
+    var s = (className || "").trim();
+    if (!s) return "class";
+    s = s.replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "");
+    return s.slice(0, 48) || "class";
+  }
+
   function renderResultTable(data) {
     if (!resultBody) return;
     const items = ((data || {}).detection || {}).balloon_items || [];
     if (!items.length) {
-      resultBody.innerHTML = "<tr><td colspan=\"4\">No extracted values found.</td></tr>";
+      resultBody.innerHTML = "<tr><td colspan=\"5\">No extracted values found.</td></tr>";
       return;
     }
     resultBody.innerHTML = "";
-    items.forEach(function (it) {
+    items.forEach(function (it, idx) {
+      if (window.BalloonParse && BalloonParse.enrichBalloonItem) {
+        BalloonParse.enrichBalloonItem(it);
+      }
+      let nominal = it.nominal_value != null ? String(it.nominal_value) : "";
+      let tol = it.tolerance != null ? String(it.tolerance) : "";
+      let others = it.others != null ? String(it.others) : "";
+      if (!nominal && !tol && !others && (it.detected_text || "").trim()) {
+        others = String(it.detected_text);
+      }
+      const cls = (it.class_name || "").trim();
       const tr = document.createElement("tr");
-      tr.innerHTML =
-        "<td>" + (it.balloon_number != null ? it.balloon_number : "") + "</td>" +
-        "<td>" + (it.class_name || "") + "</td>" +
-        "<td>" + (it.detected_text || "") + "</td>" +
-        "<td>" + (it.confidence != null ? it.confidence : "") + "</td>";
+      const tdNum = document.createElement("td");
+      tdNum.textContent = it.balloon_number != null ? String(it.balloon_number) : "";
+      const tdClass = document.createElement("td");
+      tdClass.textContent = cls;
+      const tdNom = document.createElement("td");
+      tdNom.className = "col-nominal";
+      const inpNom = document.createElement("input");
+      inpNom.type = "text";
+      inpNom.className = "table-text-input";
+      inpNom.value = nominal;
+      inpNom.placeholder = "empty";
+      inpNom.addEventListener("input", function () {
+        if (!lastJson || !lastJson.detection || !lastJson.detection.balloon_items[idx]) return;
+        lastJson.detection.balloon_items[idx].nominal_value = inpNom.value;
+        if (window.BalloonParse) BalloonParse.enrichBalloonItem(lastJson.detection.balloon_items[idx]);
+        syncJsonFromTable();
+      });
+      tdNom.appendChild(inpNom);
+      const tdTol = document.createElement("td");
+      tdTol.className = "col-tolerance";
+      const inpTol = document.createElement("input");
+      inpTol.type = "text";
+      inpTol.className = "table-text-input";
+      inpTol.value = tol;
+      inpTol.placeholder = "empty";
+      inpTol.addEventListener("input", function () {
+        if (!lastJson || !lastJson.detection || !lastJson.detection.balloon_items[idx]) return;
+        lastJson.detection.balloon_items[idx].tolerance = inpTol.value;
+        if (window.BalloonParse) BalloonParse.enrichBalloonItem(lastJson.detection.balloon_items[idx]);
+        syncJsonFromTable();
+      });
+      tdTol.appendChild(inpTol);
+      const tdOth = document.createElement("td");
+      tdOth.className = "col-others";
+      const stack = document.createElement("div");
+      stack.className = "others-stack";
+      const cropUrl = it.crop_preview_base64 || "";
+      const saveUrl = it.crop_save_base64 || cropUrl;
+      if (cropUrl || saveUrl) {
+        const box = document.createElement("div");
+        box.className = "bbox-crop-box";
+        box.setAttribute("data-detect-class", cls || "unknown");
+        const head = document.createElement("div");
+        head.className = "bbox-crop-box-head";
+        const lab = document.createElement("span");
+        lab.className = "bbox-crop-class";
+        lab.textContent = cls || "—";
+        head.appendChild(lab);
+        const sub = document.createElement("span");
+        sub.className = "bbox-crop-sub";
+        sub.textContent = "Bounding box crop";
+        head.appendChild(sub);
+        box.appendChild(head);
+        const visual = document.createElement("div");
+        visual.className = "bbox-crop-visual";
+        visual.title =
+          "Exact YOLO bounding box (full image pixels). Save uses full-res crop; thumbnail may be scaled.";
+        const img = document.createElement("img");
+        img.className = "crop-thumb";
+        img.alt = "Bounding box crop";
+        img.decoding = "async";
+        img.loading = "lazy";
+        img.onerror = function () {
+          visual.innerHTML = "";
+          visual.classList.add("bbox-crop-error");
+          visual.textContent = "Could not display crop image.";
+        };
+        img.src = cropUrl || saveUrl;
+        visual.appendChild(img);
+        box.appendChild(visual);
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "btn-secondary crop-save";
+        btn.textContent = "Save crop";
+        btn.addEventListener("click", function () {
+          const n = it.balloon_number != null ? String(it.balloon_number) : String(idx + 1);
+          var part = safeCropFilenamePart(cls);
+          var ext = saveUrl && saveUrl.indexOf("image/png") !== -1 ? ".png" : ".jpg";
+          downloadDataUrl(saveUrl, "balloon_crop_" + n + "_" + part + ext);
+        });
+        box.appendChild(btn);
+        stack.appendChild(box);
+      }
+      const inpOth = document.createElement("input");
+      inpOth.type = "text";
+      inpOth.className = "table-text-input others-text-input";
+      inpOth.value = others;
+      inpOth.placeholder = "empty";
+      inpOth.addEventListener("input", function () {
+        if (!lastJson || !lastJson.detection || !lastJson.detection.balloon_items[idx]) return;
+        lastJson.detection.balloon_items[idx].others = inpOth.value;
+        syncJsonFromTable();
+      });
+      stack.appendChild(inpOth);
+      tdOth.appendChild(stack);
+      tr.appendChild(tdNum);
+      tr.appendChild(tdClass);
+      tr.appendChild(tdNom);
+      tr.appendChild(tdTol);
+      tr.appendChild(tdOth);
       resultBody.appendChild(tr);
     });
   }
 
   function clearPanel(el, placeholder) {
     if (!el) return;
-    if (el === panelInput) revokeInputPreviewUrl();
     el.innerHTML = "";
     if (placeholder) {
       const p = document.createElement("p");
@@ -119,31 +1078,51 @@
     }
   }
 
+  function revokeInputPdfPreview() {
+    if (inputPdfPreviewUrl) {
+      try {
+        URL.revokeObjectURL(inputPdfPreviewUrl);
+      } catch (_) {}
+      inputPdfPreviewUrl = null;
+    }
+  }
+
+  /** After detection, show the same raster the server used (PDF / downscaled images). */
+  function showProcessedInputPreview(det) {
+    if (!panelInput || !det || !det.preview_image_base64) return;
+    revokeInputPdfPreview();
+    clearPanel(panelInput);
+    const img = document.createElement("img");
+    img.alt = "Input (processed image used for detection)";
+    img.src = det.preview_image_base64;
+    panelInput.appendChild(img);
+  }
+
   function showInputPreview(file) {
+    revokeInputPdfPreview();
     clearPanel(panelInput);
     setInputDownloadEnabled(!!file);
     if (!file) return;
     if (file.type === "application/pdf" || /\.pdf$/i.test(file.name)) {
-      const embed = document.createElement("embed");
-      embed.className = "pdf-preview";
-      embed.type = "application/pdf";
-      lastInputPreviewUrl = URL.createObjectURL(file);
-      embed.src = lastInputPreviewUrl;
-      panelInput.appendChild(embed);
+      try {
+        inputPdfPreviewUrl = URL.createObjectURL(file);
+        const iframe = document.createElement("iframe");
+        iframe.className = "embed-pdf-preview";
+        iframe.title = "PDF preview (page 1)";
+        iframe.src = inputPdfPreviewUrl;
+        panelInput.appendChild(iframe);
+      } catch (e) {
+        const p = document.createElement("p");
+        p.className = "placeholder";
+        p.textContent = "Could not open PDF preview in this browser. Run auto ballooning to see the rasterized drawing.";
+        panelInput.appendChild(p);
+      }
       return;
     }
     const img = document.createElement("img");
     img.alt = "Input";
-    lastInputPreviewUrl = URL.createObjectURL(file);
-    img.src = lastInputPreviewUrl;
+    img.src = URL.createObjectURL(file);
     panelInput.appendChild(img);
-  }
-
-  function showInputRaster(img, det) {
-    if (!panelInput) return;
-    revokeInputPreviewUrl();
-    clearPanel(panelInput);
-    panelInput.appendChild(makeCanvasFromImage(img, det, function () {}));
   }
 
   function loadImageForDraw(det) {
@@ -178,18 +1157,60 @@
     return canvas;
   }
 
+  /**
+   * Redraw the current balloon canvas in place (same element + listeners).
+   * Use this while dragging or drawing a create-rect so we do not replace the canvas
+   * (replacing it dropped drag handlers and made Edit feel broken).
+   */
+  function repaintBalloonLayerOnly() {
+    if (!lastBalloonCanvas || !balloonImageCache || !lastJson || !lastJson.detection) return;
+    const det = mergeDetForDraw(lastJson.detection);
+    const iw = Number(det.width) || balloonImageCache.naturalWidth;
+    const maxW = Math.min(1100, iw);
+    const sx = maxW / iw;
+    const canvas = lastBalloonCanvas;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(balloonImageCache, 0, 0, canvas.width, canvas.height);
+    drawDetectionsThenBalloons(ctx, sx, det);
+  }
+
   function drawDetections(ctx, scale, det) {
     (det.detections || []).forEach(function (d) {
       const bb = d.bbox;
       if (!bb || bb.length < 4) return;
-      ctx.strokeStyle = "#34d399";
+      ctx.strokeStyle = "#ffffff";
       ctx.lineWidth = 2;
       ctx.strokeRect(bb[0] * scale, bb[1] * scale, (bb[2] - bb[0]) * scale, (bb[3] - bb[1]) * scale);
     });
   }
 
+  function drawDetectionsThenBalloons(ctx, scale, det) {
+    drawDetections(ctx, scale, det);
+    if (pendingRectOverlay) {
+      const pr = pendingRectOverlay;
+      const x1 = Math.min(pr.x1, pr.x2);
+      const y1 = Math.min(pr.y1, pr.y2);
+      const x2 = Math.max(pr.x1, pr.x2);
+      const y2 = Math.max(pr.y1, pr.y2);
+      ctx.strokeStyle = "#fbbf24";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 4]);
+      ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+      ctx.setLineDash([]);
+    }
+    drawBalloons(ctx, scale, det);
+  }
+
   function drawBalloons(ctx, scale, det) {
-    const anns = det.drawing_annotations || [];
+    if (window.BalloonParse && BalloonParse.repairMultiplierDrawingAnnotations) {
+      BalloonParse.repairMultiplierDrawingAnnotations(det);
+    }
+    const anns =
+      window.BalloonParse && BalloonParse.annotationsForCanvas
+        ? BalloonParse.annotationsForCanvas(det)
+        : det.drawing_annotations || [];
+    ctx.canvas._balloonHitTest = [];
+    const overrides = det._balloon_ui_overrides || {};
     const BALLOON_DIAMETER_MM = 5;
     const CSS_DPI = 96;
     const pxPerMm = CSS_DPI / 25.4;
@@ -329,27 +1350,54 @@
       return { cx: cx, cy: cy };
     }
 
+    function annReadingOrderKey(ann) {
+      const bb = ann.BBox;
+      if (bb && bb.length >= 4) {
+        return { cy: Number(bb[1]), cx: Number(bb[0]) };
+      }
+      if (Array.isArray(ann.TextPos) && ann.TextPos.length >= 2) {
+        return { cy: Number(ann.TextPos[1]), cx: Number(ann.TextPos[0]) };
+      }
+      return { cy: 0, cx: 0 };
+    }
+
     const sorted = anns.slice().sort(function (a, b) {
-      const ay = Array.isArray(a.TextPos) && a.TextPos.length >= 2 ? Number(a.TextPos[1]) : ((a.BBox && a.BBox.length >= 4) ? (a.BBox[1] + a.BBox[3]) / 2 : 0);
-      const by = Array.isArray(b.TextPos) && b.TextPos.length >= 2 ? Number(b.TextPos[1]) : ((b.BBox && b.BBox.length >= 4) ? (b.BBox[1] + b.BBox[3]) / 2 : 0);
-      return ay - by;
+      const ka = annReadingOrderKey(a);
+      const kb = annReadingOrderKey(b);
+      if (ka.cy !== kb.cy) return ka.cy - kb.cy;
+      return ka.cx - kb.cx;
     });
 
     sorted.forEach(function (ann) {
-      const bb = ann.BBox;
+      const bb = ann.BBox || ann.bbox;
       if (!bb || bb.length < 4) return;
       const x1 = bb[0] * scale;
       const y1 = bb[1] * scale;
       const x2 = bb[2] * scale;
       const y2 = bb[3] * scale;
-      const preferred = chooseCenter(ann, x1, y1, x2, y2);
-      const whiteSpot = chooseBestNearby(preferred.cx, preferred.cy);
-      // If still on dense notes/text, move to side lane in top-to-down sequence.
-      const inkAtWhiteSpot = getInkRatio(whiteSpot.cx, whiteSpot.cy);
-      const laneSpot = inkAtWhiteSpot > 0.055 ? placeInSideLane(preferred) : whiteSpot;
-      const pos = nudgeAway(laneSpot.cx, laneSpot.cy);
-      const cx = pos.cx;
-      const cy = pos.cy;
+      const canvasId =
+        window.BalloonParse && BalloonParse.drawingCanvasLabel
+          ? BalloonParse.drawingCanvasLabel(ann)
+          : ann.id;
+      const o =
+        overrides[canvasId] ||
+        overrides[ann.id] ||
+        (ann.display_id != null ? overrides[ann.display_id] : undefined) ||
+        (ann.parent_balloon_number != null ? overrides[ann.parent_balloon_number] : undefined);
+      let cx;
+      let cy;
+      if (o && Number.isFinite(o.cx) && Number.isFinite(o.cy)) {
+        cx = clamp(o.cx, r + 1, w - r - 1);
+        cy = clamp(o.cy, r + 1, h - r - 1);
+      } else {
+        const preferred = chooseCenter(ann, x1, y1, x2, y2);
+        const whiteSpot = chooseBestNearby(preferred.cx, preferred.cy);
+        const inkAtWhiteSpot = getInkRatio(whiteSpot.cx, whiteSpot.cy);
+        const laneSpot = inkAtWhiteSpot > 0.055 ? placeInSideLane(preferred) : whiteSpot;
+        const pos = nudgeAway(laneSpot.cx, laneSpot.cy);
+        cx = pos.cx;
+        cy = pos.cy;
+      }
 
       ctx.save();
       ctx.strokeStyle = darkRed;
@@ -358,42 +1406,243 @@
       ctx.beginPath();
       ctx.arc(cx, cy, r, 0, Math.PI * 2);
       ctx.stroke();
-      ctx.font = "bold 8px system-ui, sans-serif";
+      const label =
+        window.BalloonParse && BalloonParse.drawingCanvasLabel
+          ? BalloonParse.drawingCanvasLabel(ann)
+          : String(ann.id != null ? ann.id : "");
+      const fontPx = label.length > 4 ? 6 : label.length > 3 ? 7 : 8;
+      ctx.font = "bold " + fontPx + "px system-ui, sans-serif";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      ctx.fillText(String(ann.id != null ? ann.id : ""), cx, cy);
+      ctx.fillText(label, cx, cy);
       ctx.restore();
       placed.push({ cx: cx, cy: cy });
+      const hitR = Math.max(22, r * 2.4);
+      ctx.canvas._balloonHitTest.push({ id: label, cx: cx, cy: cy, r: r, hitR: hitR });
     });
+  }
+
+  function mergeDetForDraw(det) {
+    if (!det) return null;
+    const d = Object.assign({}, det);
+    const merged = Object.assign({}, det.balloon_ui_overrides || {}, balloonUiOverrides);
+    if (Object.keys(merged).length) {
+      d._balloon_ui_overrides = merged;
+    }
+    return d;
+  }
+
+  function balloonHitDistance(mx, my, h) {
+    const maxD = h.hitR != null ? h.hitR : h.r + 8;
+    return Math.hypot(mx - h.cx, my - h.cy) <= maxD;
+  }
+
+  function detachBalloonDragListeners() {
+    document.removeEventListener("mousemove", onDocumentBalloonDragMove);
+    document.removeEventListener("mouseup", onDocumentBalloonDragEnd);
+  }
+
+  function onDocumentBalloonDragMove(ev) {
+    if (!activeBalloonDrag || !lastBalloonCanvas || !lastJson) return;
+    const canvas = lastBalloonCanvas;
+    const rect = canvas.getBoundingClientRect();
+    const sx = canvas.width / rect.width;
+    const mx = (ev.clientX - rect.left) * sx;
+    const my = (ev.clientY - rect.top) * sx;
+    balloonUiOverrides[activeBalloonDrag.id] = {
+      cx: activeBalloonDrag.ox + (mx - activeBalloonDrag.startMx),
+      cy: activeBalloonDrag.oy + (my - activeBalloonDrag.startMy),
+    };
+    repaintBalloonLayerOnly();
+  }
+
+  function onDocumentBalloonDragEnd() {
+    if (!activeBalloonDrag) return;
+    detachBalloonDragListeners();
+    activeBalloonDrag = null;
+    if (lastBalloonCanvas) lastBalloonCanvas.style.cursor = "default";
+    if (lastJson && lastJson.detection) {
+      lastJson.detection.balloon_ui_overrides = Object.assign({}, balloonUiOverrides);
+      syncJsonFromTable();
+    }
+  }
+
+  function attachCanvasInteractions(canvas) {
+    canvas.addEventListener("mousedown", function (e) {
+      if (balloonMode === "create") {
+        const rect = canvas.getBoundingClientRect();
+        const sc = canvas.width / rect.width;
+        const x1 = (e.clientX - rect.left) * sc;
+        const y1 = (e.clientY - rect.top) * sc;
+        function onMove(ev) {
+          const c = lastBalloonCanvas;
+          if (!c) return;
+          const r = c.getBoundingClientRect();
+          const s = c.width / r.width;
+          const x2 = (ev.clientX - r.left) * s;
+          const y2 = (ev.clientY - r.top) * s;
+          pendingRectOverlay = { x1: x1, y1: y1, x2: x2, y2: y2 };
+          repaintBalloonLayerOnly();
+        }
+        function onUp(ev) {
+          document.removeEventListener("mousemove", onMove);
+          document.removeEventListener("mouseup", onUp);
+          const c = lastBalloonCanvas;
+          pendingRectOverlay = null;
+          if (!c || !lastJson || !lastJson.detection) {
+            paintBalloonCanvas();
+            return;
+          }
+          const r = c.getBoundingClientRect();
+          const s = c.width / r.width;
+          const x2 = (ev.clientX - r.left) * s;
+          const y2 = (ev.clientY - r.top) * s;
+          if (Math.abs(x2 - x1) > 6 && Math.abs(y2 - y1) > 6) {
+            addManualDetectionFromRect(c, x1, y1, x2, y2);
+          } else {
+            paintBalloonCanvas();
+          }
+        }
+        document.addEventListener("mousemove", onMove);
+        document.addEventListener("mouseup", onUp);
+        e.preventDefault();
+        return;
+      }
+
+      if (balloonMode === "delete") {
+        const hit = canvas._balloonHitTest;
+        if (!hit || !hit.length) return;
+        const rect = canvas.getBoundingClientRect();
+        const sx = canvas.width / rect.width;
+        const mx = (e.clientX - rect.left) * sx;
+        const my = (e.clientY - rect.top) * sx;
+        for (let i = hit.length - 1; i >= 0; i--) {
+          const h = hit[i];
+          if (balloonHitDistance(mx, my, h)) {
+            deleteBalloonById(h.id);
+            e.preventDefault();
+            return;
+          }
+        }
+        return;
+      }
+
+      if (balloonMode !== "edit") return;
+      const hit = canvas._balloonHitTest;
+      if (!hit || !hit.length) return;
+      const rect = canvas.getBoundingClientRect();
+      const sx = canvas.width / rect.width;
+      const mx = (e.clientX - rect.left) * sx;
+      const my = (e.clientY - rect.top) * sx;
+      for (let i = hit.length - 1; i >= 0; i--) {
+        const h = hit[i];
+        if (balloonHitDistance(mx, my, h)) {
+          const ov = balloonUiOverrides[h.id];
+          const ox = ov && Number.isFinite(ov.cx) ? ov.cx : h.cx;
+          const oy = ov && Number.isFinite(ov.cy) ? ov.cy : h.cy;
+          activeBalloonDrag = { id: h.id, startMx: mx, startMy: my, ox: ox, oy: oy };
+          canvas.style.cursor = "grabbing";
+          document.addEventListener("mousemove", onDocumentBalloonDragMove);
+          document.addEventListener("mouseup", onDocumentBalloonDragEnd);
+          e.preventDefault();
+          return;
+        }
+      }
+    });
+
+    canvas.addEventListener("mousemove", function (e) {
+      if (activeBalloonDrag) return;
+      if (balloonMode === "create") {
+        canvas.style.cursor = "crosshair";
+        return;
+      }
+      if (balloonMode === "delete") {
+        const hit = canvas._balloonHitTest;
+        if (!hit || !hit.length) {
+          canvas.style.cursor = "default";
+          return;
+        }
+        const rect = canvas.getBoundingClientRect();
+        const sx = canvas.width / rect.width;
+        const mx = (e.clientX - rect.left) * sx;
+        const my = (e.clientY - rect.top) * sx;
+        let over = false;
+        for (let i = 0; i < hit.length; i++) {
+          if (balloonHitDistance(mx, my, hit[i])) {
+            over = true;
+            break;
+          }
+        }
+        canvas.style.cursor = over ? "not-allowed" : "default";
+        return;
+      }
+      if (balloonMode !== "edit") {
+        canvas.style.cursor = "default";
+        return;
+      }
+      const hit = canvas._balloonHitTest;
+      if (!hit || !hit.length) return;
+      const rect = canvas.getBoundingClientRect();
+      const sx = canvas.width / rect.width;
+      const mx = (e.clientX - rect.left) * sx;
+      const my = (e.clientY - rect.top) * sx;
+      let over = false;
+      for (let i = 0; i < hit.length; i++) {
+        if (balloonHitDistance(mx, my, hit[i])) {
+          over = true;
+          break;
+        }
+      }
+      canvas.style.cursor = over ? "grab" : "default";
+    });
+
+    canvas.addEventListener("mouseup", function () {
+      /* drag end handled on document */
+    });
+  }
+
+  function paintBalloonCanvas() {
+    detachBalloonDragListeners();
+    activeBalloonDrag = null;
+    if (!balloonImageCache || !lastJson || !lastJson.detection) return;
+    clearPanel(panelBalloon);
+    const det = mergeDetForDraw(lastJson.detection);
+    const balloonCanvas = makeCanvasFromImage(balloonImageCache, det, drawDetectionsThenBalloons);
+    panelBalloon.appendChild(balloonCanvas);
+    lastBalloonCanvas = balloonCanvas;
+    attachCanvasInteractions(balloonCanvas);
+    setBalloonDownloadEnabled(true);
   }
 
   function renderResults(data) {
     const det = data.detection;
     if (!det) return;
+    balloonUiOverrides = Object.assign({}, det.balloon_ui_overrides || {});
+    balloonMode = null;
+    pendingRectOverlay = null;
+    detachBalloonDragListeners();
+    activeBalloonDrag = null;
+    setBalloonModeButtons();
 
     loadImageForDraw(det)
       .then(function (img) {
-        if (panelDetect) {
-          clearPanel(panelDetect);
-          panelDetect.appendChild(makeCanvasFromImage(img, det, drawDetections));
-        }
-
-        showInputRaster(img, det);
-
-        clearPanel(panelBalloon);
-        const balloonCanvas = makeCanvasFromImage(img, det, drawBalloons);
-        panelBalloon.appendChild(balloonCanvas);
-        lastBalloonCanvas = balloonCanvas;
-        setBalloonDownloadEnabled(true);
+        balloonImageCache = img;
+        lastJson = data;
+        setBalloonToolsEnabled(true);
+        setModeHint(
+          "Balloons are numbered top→bottom, left→right. Create / Edit / Delete, then Save."
+        );
+        paintBalloonCanvas();
+        showProcessedInputPreview(det);
 
         if (!det.preview_image_base64 && lastFile && img.src.indexOf("blob:") === 0) {
           URL.revokeObjectURL(img.src);
         }
       })
       .catch(function (e) {
-        if (panelDetect) clearPanel(panelDetect, "Could not render: " + e);
-        clearPanel(panelBalloon);
+        clearPanel(panelBalloon, "Could not render: " + e);
         lastBalloonCanvas = null;
+        balloonImageCache = null;
         setBalloonDownloadEnabled(false);
       });
   }
@@ -457,13 +1706,17 @@
     });
     rows.push([]);
     rows.push(["Extracted text (per balloon)"]);
-    rows.push(["balloon_number", "class_name", "confidence", "detected_text"]);
+    rows.push(["balloon_number", "class_name", "confidence", "nominal_value", "tolerance", "others"]);
     (det.balloon_items || []).forEach(function (it) {
+      var oth = it.others != null ? String(it.others) : "";
+      if (!oth && (it.detected_text || "").trim()) oth = String(it.detected_text);
       rows.push([
         it.balloon_number != null ? it.balloon_number : "",
         it.class_name || "",
         it.confidence != null ? it.confidence : "",
-        it.detected_text || "",
+        it.nominal_value != null ? it.nominal_value : "",
+        it.tolerance != null ? it.tolerance : "",
+        oth,
       ]);
     });
     return rows.map(function (r) { return r.map(toCsvCell).join(","); }).join("\n");
@@ -487,19 +1740,6 @@
     });
   }
 
-  if (inspectionReport) {
-    inspectionReport.addEventListener("click", function () {
-      if (!lastJson) return;
-      try {
-        sessionStorage.setItem(INSPECTION_STORAGE_KEY, JSON.stringify(lastJson));
-      } catch (e) {
-        setStatus("Could not open inspection report: " + e);
-        return;
-      }
-      window.location.href = "/inspection-report";
-    });
-  }
-
   if (downloadExcel) {
     downloadExcel.addEventListener("click", async function () {
       if (!lastJson) return;
@@ -507,9 +1747,11 @@
         const paths = ["/api/v1/export-excel", "/api/export-excel", "/export-excel"];
         let r = null;
         for (let i = 0; i < paths.length; i++) {
+          const _excelHdr = { "Content-Type": "application/json" };
+          const _excelTok = getAuthToken(); if (_excelTok) _excelHdr["Authorization"] = "Bearer " + _excelTok;
           const rr = await fetch(ORIGIN + paths[i], Object.assign({
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: _excelHdr,
             body: JSON.stringify(lastJson),
           }, cred));
           if (authRedirect(rr.status)) return;
@@ -544,20 +1786,111 @@
     });
   }
 
-  fileInput.addEventListener("change", function () {
-    lastFile = fileInput.files && fileInput.files[0];
-    showInputPreview(lastFile);
-    lastJson = null;
-    if (jsonOut) jsonOut.textContent = "{}";
-    lastBalloonCanvas = null;
-    setBalloonDownloadEnabled(false);
-    setExcelDownloadEnabled(false);
-    setInspectionReportEnabled(false);
-    if (resultBody) resultBody.innerHTML = "<tr><td colspan=\"4\">Run auto ballooning to see extracted values.</td></tr>";
-    if (panelDetect) clearPanel(panelDetect, "Run detect to see green boxes.");
-    clearPanel(panelBalloon, "Run auto ballooning to see balloons here.");
+  if (inspectionReport) {
+    inspectionReport.addEventListener("click", function () {
+      if (!lastJson) return;
+      try {
+        persistInspectionPayload(lastJson);
+      } catch (e) {
+        setStatus("Could not open inspection report: " + e);
+        return;
+      }
+      window.open("/inspection-report", "_blank", "noopener,noreferrer");
+    });
+  }
+
+  if (fileInput) {
+    fileInput.addEventListener("change", function () {
+      const newFile = fileInput.files && fileInput.files[0];
+      resetSession();
+      lastFile = newFile;
+      showInputPreview(newFile);
+    });
+  }
+
+  if (btnBalloonMenu) {
+    btnBalloonMenu.addEventListener("click", function (e) {
+      e.stopPropagation();
+      if (btnBalloonMenu.disabled) return;
+      setQuickPanelOpen(!!balloonQuickPanel.hidden);
+    });
+  }
+  if (btnCloseQuickPanel) {
+    btnCloseQuickPanel.addEventListener("click", function () {
+      setQuickPanelOpen(false);
+    });
+  }
+  if (btnQuickSave) {
+    btnQuickSave.addEventListener("click", function (e) {
+      e.stopPropagation();
+      applyQuickTableToDetection();
+    });
+  }
+  if (btnCloseCropModal) {
+    btnCloseCropModal.addEventListener("click", function (e) {
+      e.stopPropagation();
+      closeQuickCropModal();
+    });
+  }
+  if (quickCropModalBackdrop) {
+    quickCropModalBackdrop.addEventListener("click", function (e) {
+      e.stopPropagation();
+      closeQuickCropModal();
+    });
+  }
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && quickCropViewModal && !quickCropViewModal.hidden) {
+      closeQuickCropModal();
+    }
+  });
+  document.addEventListener("click", function (e) {
+    if (!balloonQuickPanel || balloonQuickPanel.hidden) return;
+    if (e.target.closest && e.target.closest("#balloonQuickPanel")) return;
+    if (e.target.closest && e.target.closest(".balloon-menu-wrap")) return;
+    if (e.target.closest && e.target.closest("#quickCropViewModal")) return;
+    setQuickPanelOpen(false);
   });
 
+  if (btnModeCreate) {
+    btnModeCreate.addEventListener("click", function () {
+      balloonMode = balloonMode === "create" ? null : "create";
+      pendingRectOverlay = null;
+      setBalloonModeButtons();
+      setModeHint(
+        balloonMode === "create"
+          ? "Create: drag on the drawing to draw a rectangle, then release."
+          : ""
+      );
+      paintBalloonCanvas();
+    });
+  }
+  if (btnModeEdit) {
+    btnModeEdit.addEventListener("click", function () {
+      balloonMode = balloonMode === "edit" ? null : "edit";
+      setBalloonModeButtons();
+      setModeHint(balloonMode === "edit" ? "Edit: drag red balloon circles to move them (works even if the cursor leaves the image)." : "");
+      paintBalloonCanvas();
+    });
+  }
+  if (btnModeDelete) {
+    btnModeDelete.addEventListener("click", function () {
+      balloonMode = balloonMode === "delete" ? null : "delete";
+      setBalloonModeButtons();
+      setModeHint(
+        balloonMode === "delete"
+          ? "Delete: click a red balloon to remove it. Remaining balloons are renumbered. Then Save."
+          : ""
+      );
+      paintBalloonCanvas();
+    });
+  }
+  if (btnModeSave) {
+    btnModeSave.addEventListener("click", function () {
+      applyBalloonSave();
+    });
+  }
+
+  if (runBtn) {
   runBtn.addEventListener("click", async function () {
     if (!lastFile) {
       setStatus("Choose a file first.");
@@ -570,8 +1903,12 @@
     try {
       const fd = new FormData();
       fd.append("file", lastFile);
+      const _detectHeaders = {};
+      const _detectToken = getAuthToken();
+      if (_detectToken) _detectHeaders["Authorization"] = "Bearer " + _detectToken;
       const r = await fetch(ORIGIN + "/api/v1/detect", Object.assign({
         method: "POST",
+        headers: _detectHeaders,
         body: fd,
       }, cred));
       if (authRedirect(r.status)) return;
@@ -590,8 +1927,13 @@
         return;
       }
       lastJson = data;
-      renderResults(data);
-      renderResultTable(data);
+      enrichDetectionItems(data.detection);
+      if (window.BalloonParse && BalloonParse.saveInspectionMetaFromDetection) {
+        BalloonParse.saveInspectionMetaFromDetection(data.detection);
+      }
+    applyBalloonNumberingPipeline();
+    renderResults(lastJson);
+    renderResultTable(lastJson);
       setExcelDownloadEnabled(true);
       setInspectionReportEnabled(true);
       setStatus("Done.");
@@ -601,4 +1943,5 @@
     }
     runBtn.disabled = false;
   });
+  }
 })();

@@ -15,6 +15,7 @@ Usage in route signatures:
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -23,6 +24,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
 from auth.database import get_db
+from auth.settings import auth_enabled, balloon_auth_disabled, database_configured, trial_days, trial_expired_message
 from auth.models import Organization, RoleEnum, User
 from auth.utils import decode_access_token
 
@@ -179,8 +181,103 @@ def check_tenant_access(org: Optional[Organization], db: Session) -> bool:
 
 _TRIAL_EXPIRED_RESPONSE = {
     "error": "TRIAL_EXPIRED",
-    "message": "Your 7-day free trial has expired. Please upgrade to continue.",
+    "message": trial_expired_message(),
 }
+
+
+def _permission_denied(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={"error": "PERMISSION_DENIED", "message": message},
+    )
+
+
+def _enforce_engineer_balloon_access(
+    user: User,
+    db: Session,
+    *,
+    need_write: bool = False,
+    need_delete: bool = False,
+) -> None:
+    """Super admin bypasses; engineers must be active with granted permissions."""
+    if user.role == RoleEnum.super_admin:
+        return
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account has been deactivated. Contact your administrator.",
+        )
+
+    if not getattr(user, "can_read", True):
+        raise _permission_denied(
+            "You do not have access yet. Ask your super admin to enable your account."
+        )
+
+    if need_write and not getattr(user, "can_write", True):
+        raise _permission_denied("You do not have permission to modify or upload drawings.")
+
+    if need_delete and not getattr(user, "can_delete", True):
+        raise _permission_denied("You do not have permission to delete.")
+
+    org = db.query(Organization).filter_by(tenant_id=user.tenant_id).first()
+    if not check_tenant_access(org, db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=_TRIAL_EXPIRED_RESPONSE,
+        )
+
+
+def _resolve_balloon_user(
+    credentials: Optional[HTTPAuthorizationCredentials],
+    db: Session,
+) -> User:
+    if not database_configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication database is not configured. Set DATABASE_URL on the server.",
+        )
+
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required. Please log in.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return get_current_user(credentials, db)
+
+
+def require_balloon_api_access(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
+    db: Session = Depends(get_db),
+) -> Optional[User]:
+    """
+    Read-level business API access (view / open app APIs).
+
+    Engineers need: active account, read permission, valid trial/subscription.
+    """
+    if balloon_auth_disabled():
+        return get_optional_user(credentials, db)
+
+    user = _resolve_balloon_user(credentials, db)
+    _enforce_engineer_balloon_access(user, db, need_write=False, need_delete=False)
+    return user
+
+
+def require_balloon_write_access(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
+    db: Session = Depends(get_db),
+) -> Optional[User]:
+    """
+    Write-level business API access (upload, detect, export, edit balloons).
+    """
+    if balloon_auth_disabled():
+        return get_optional_user(credentials, db)
+
+    user = _resolve_balloon_user(credentials, db)
+    _enforce_engineer_balloon_access(user, db, need_write=True, need_delete=False)
+    return user
 
 
 def require_subscription_if_auth(

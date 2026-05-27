@@ -5,10 +5,11 @@ Delivery strategy (in priority order):
   1. Resend    – if EMAIL.RESEND_API_KEY is set (or PROVIDER == "resend").
   2. SendGrid  – if EMAIL.SENDGRID_API_KEY is set.
   3. SMTP      – if EMAIL.SMTP_HOST is set.
-  4. Console   – development fallback; prints the message to stdout.
+  4. Console   – development fallback only when ALLOW_DEV_OTP=1.
 """
 from __future__ import annotations
 
+import os
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -17,7 +18,32 @@ import config
 
 
 def _cfg() -> dict:
-    return config.GetConfiguration("EMAIL") or {}
+    """Merge config.json EMAIL section with backend/.env overrides."""
+    c = dict(config.GetConfiguration("EMAIL") or {})
+    env_map = {
+        "RESEND_API_KEY": "RESEND_API_KEY",
+        "RESEND_FROM_EMAIL": "FROM_EMAIL",
+        "FROM_EMAIL": "FROM_EMAIL",
+        "SMTP_HOST": "SMTP_HOST",
+        "SMTP_PORT": "SMTP_PORT",
+        "SMTP_USER": "SMTP_USER",
+        "SMTP_PASSWORD": "SMTP_PASSWORD",
+        "SENDGRID_API_KEY": "SENDGRID_API_KEY",
+    }
+    for env_key, cfg_key in env_map.items():
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            c[cfg_key] = val
+    return c
+
+
+def email_provider_configured() -> bool:
+    c = _cfg()
+    return bool(
+        c.get("RESEND_API_KEY", "").strip()
+        or c.get("SENDGRID_API_KEY", "").strip()
+        or c.get("SMTP_HOST", "").strip()
+    )
 
 
 def _print_console_temp_password(to_email: str, subject: str, temp_password: str) -> None:

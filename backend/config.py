@@ -34,6 +34,13 @@ def _apply_env_overrides():
     oa = os.environ.get("OPENAI_API_KEY")
     if oa and isinstance(ConfigDict.get("OPENAI"), dict):
         ConfigDict["OPENAI"]["openai_api_key"] = oa
+        ConfigDict["OPENAI"]["USE_FOR_VISION"] = True
+        ConfigDict["OPENAI"]["USE_FOR_CHAT"] = True
+    ant = os.environ.get("ANTHROPIC_API_KEY")
+    if ant:
+        if not isinstance(ConfigDict.get("ANTHROPIC"), dict):
+            ConfigDict["ANTHROPIC"] = {}
+        ConfigDict["ANTHROPIC"]["API_KEY"] = ant
 
 
 def InitConfiguration(configFile: str | None = None):

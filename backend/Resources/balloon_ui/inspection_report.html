@@ -5,25 +5,27 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <title>Inspection report — Auto Ballooning &amp; inspection report Software System</title>
-  <link rel="stylesheet" href="/assets/style.css?v=24" />
-  <link rel="stylesheet" href="/assets/inspection_report.css?v=4" />
+  <link rel="stylesheet" href="/assets/style.css?v=28" />
+  <link rel="stylesheet" href="/assets/inspection_report.css?v=9" />
 </head>
 <body class="ir-body">
   <h1 class="ir-sr-only">Auto Ballooning &amp; inspection report Software System — Inspection report</h1>
   <header class="ir-top">
     <a class="ir-brand" href="/app" aria-label="SmorX.ai home">
-      <img src="/assets/smorx-logo.png" alt="SmorX.ai" />
+      <img class="brand-logo brand-logo--full" src="/assets/smorx-logo-full.png?v=1" alt="SmorX.ai" width="400" height="164" />
     </a>
+    <h1 class="ir-center-title">Inspection Software system</h1>
     <div class="ir-top-actions ir-nav-pills">
       <span class="btn-inspection btn-inspection-active" aria-current="page">Inspection report</span>
-      <a href="/app" class="btn-dashboard" id="irDashboardBtn">Go to Dashboard</a>
+      <button type="button" id="irDownloadReport" class="btn-secondary" disabled>Download report</button>
+      <a href="http://localhost:3000/dashboard" class="btn-dashboard" id="irDashboardBtn">Go to Dashboard</a>
     </div>
   </header>
 
   <main class="ir-main" id="irMain">
     <p id="irEmpty" class="ir-empty" hidden>
       No ballooning data found. Run auto ballooning first, then open Inspection report.
-      <a href="/app">Go to Dashboard</a>
+      <a href="#" id="irEmptyAppLink">Open Auto Ballooning app</a>
     </p>
 
     <div id="irContent" hidden>
@@ -53,6 +55,8 @@
     </div>
   </main>
 
-  <script src="/assets/inspection_report.js?v=3"></script>
+  <script src="/assets/inspection_store.js?v=6"></script>
+  <script src="/assets/balloon_parse.js?v=42"></script>
+  <script src="/assets/inspection_report.js?v=16"></script>
 </body>
 </html>

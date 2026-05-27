@@ -13,6 +13,11 @@
   border-radius: 12px;
   padding: 1.5rem 1.25rem;
 }
+.auth-card.auth-card-login {
+  max-width: 540px;
+  padding: 2.25rem 2rem 2rem;
+  border-radius: 14px;
+}
 .auth-card.wide {
   max-width: 900px;
 }
@@ -21,21 +26,50 @@
   font-size: 1.25rem;
   text-align: center;
 }
+.auth-card.auth-card-login h1 {
+  font-size: 1.55rem;
+  font-weight: 700;
+  margin-top: 0.35rem;
+}
 .login-brand {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 0.35rem;
-  margin-bottom: 0.25rem;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+  width: 100%;
 }
+.login-brand .brand-logo,
 .login-brand img {
-  max-height: 100px;
+  display: block;
+  width: auto;
+  max-width: min(360px, 100%);
+  height: auto;
+  object-fit: contain;
+  object-position: center center;
+  margin: 0 auto;
+  image-rendering: auto;
+}
+.login-brand img.brand-logo--raster {
+  max-width: 195px;
+  max-height: 85px;
+}
+.login-brand img.brand-logo--full {
+  width: min(400px, 100%);
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+}
+.login-brand .brand-logo--svg {
+  width: min(360px, 100%);
+  max-width: 100%;
+  height: auto;
 }
 .login-brand h1 {
-  font-size: 0.95rem;
+  font-size: 1.55rem;
   line-height: 1.3;
-  max-width: 22rem;
+  max-width: none;
 }
 .auth-hint {
   color: #8b9cb3;
@@ -43,14 +77,24 @@
   margin: 0 0 1rem;
   text-align: center;
 }
+.auth-card.auth-card-login .auth-hint {
+  font-size: 1rem;
+  line-height: 1.45;
+  margin-bottom: 1.25rem;
+}
 .auth-card label {
   display: block;
   font-size: 0.75rem;
   color: #8b9cb3;
   margin: 0.5rem 0 0.25rem;
 }
+.auth-card.auth-card-login label {
+  font-size: 0.85rem;
+  margin-top: 0.75rem;
+}
 .auth-card input[type="email"],
-.auth-card input[type="password"] {
+.auth-card input[type="password"],
+.auth-card input[type="text"] {
   width: 100%;
   padding: 0.5rem 0.65rem;
   border-radius: 8px;
@@ -58,6 +102,21 @@
   background: #0f1419;
   color: #e8eef5;
   font-size: 1rem;
+}
+.auth-card.auth-card-login input[type="email"],
+.auth-card.auth-card-login input[type="password"],
+.auth-card.auth-card-login input[type="text"] {
+  padding: 0.7rem 0.85rem;
+  font-size: 1.05rem;
+  border-radius: 10px;
+}
+.auth-card.auth-card-login .auth-actions {
+  margin-top: 1.5rem;
+}
+.auth-card.auth-card-login .auth-actions .primary {
+  min-width: 10rem;
+  padding: 0.7rem 2rem;
+  font-size: 1.05rem;
 }
 .auth-actions {
   display: flex;
@@ -71,6 +130,10 @@
   color: #6b7c93;
   margin: 1rem 0 0;
   text-align: center;
+}
+.auth-card.auth-card-login .auth-small {
+  font-size: 0.88rem;
+  margin-top: 1.25rem;
 }
 .auth-msg {
   min-height: 1.25rem;

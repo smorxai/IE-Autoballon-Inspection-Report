@@ -12,11 +12,13 @@ Web application for engineering drawing auto-ballooning (YOLO detection) and ins
 ```powershell
 cd backend
 pip install -r requirements.txt
-$env:SMORX_DISABLE_BALLOON_AUTH = "1"   # optional: skip auth in dev
+# Add DATABASE_URL + SUPER_ADMIN_* to backend/.env (see .env.example)
 python serve_balloon.py
 ```
 
-Open http://127.0.0.1:9080/app
+Open http://127.0.0.1:9080/login — you must log in before using `/app`.
+
+For local dev **without** login, set `SMORX_DISABLE_BALLOON_AUTH=1` in `.env` (not recommended once PostgreSQL is configured).
 
 ## Configuration
 

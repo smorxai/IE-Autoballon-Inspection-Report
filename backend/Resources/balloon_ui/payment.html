@@ -8,13 +8,33 @@
   <link rel="stylesheet" href="/assets/auth.css?v=1" />
 </head>
 <body class="auth-body">
-  <div class="auth-card">
-    <h1>Trial period ended</h1>
-    <p>Your 3-day trial has ended. Please complete payment to continue using Auto Ballooning.</p>
-    <p class="auth-small">Contact your administrator or SmorX support to activate your account.</p>
-    <div class="auth-actions">
-      <a class="primary" href="/login" style="text-align:center;text-decoration:none;display:inline-block;">Back to login</a>
+  <div class="auth-card" id="panelMain">
+    <h1>Your free trial has expired</h1>
+    <p>Upgrade to continue using Auto Ballooning for <strong id="userEmail"></strong>.</p>
+
+    <div class="auth-plan-card">
+      <div class="auth-plan-name">Professional Plan</div>
+      <div class="auth-plan-price" id="planPrice">₹999</div>
+      <div class="auth-small">Unlimited drawings · Excel export · Session history</div>
     </div>
+
+    <div id="msg" class="auth-msg"></div>
+
+    <div class="auth-actions">
+      <button type="button" id="btnPay" class="primary">Pay with Razorpay</button>
+      <a class="btn-link" href="/login">Back to login</a>
+    </div>
+
+    <p class="auth-small">Secured by Razorpay · UPI, cards, and net banking accepted</p>
   </div>
+
+  <div class="auth-card" id="panelSuccess" style="display:none">
+    <div class="success-icon">✓</div>
+    <h2 class="success-heading">Payment successful</h2>
+    <p class="auth-hint">Your subscription is active. Redirecting to the app…</p>
+  </div>
+
+  <script src="/assets/auth.js?v=1"></script>
+  <script src="/assets/payment.js?v=1"></script>
 </body>
 </html>
