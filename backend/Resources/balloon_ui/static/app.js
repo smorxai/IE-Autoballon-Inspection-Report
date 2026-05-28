@@ -2229,7 +2229,15 @@
       }
       if (authRedirect(r.status, data)) return;
       if (!data) {
-        setStatus("Non-JSON response HTTP " + r.status);
+        if (r.status === 502 || r.status === 504) {
+          setStatus(
+            "Server timed out (HTTP " +
+              r.status +
+              "). On Render use Render safe mode or upgrade instance RAM. Try a smaller PDF/image."
+          );
+        } else {
+          setStatus("Non-JSON response HTTP " + r.status);
+        }
         if (jsonOut) jsonOut.textContent = text.slice(0, 4000);
         return;
       }

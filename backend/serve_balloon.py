@@ -20,6 +20,7 @@ Env:
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -1659,6 +1660,8 @@ def _mark_yolo_detection_sources(payload: dict) -> None:
 
 
 def _region_prepass_enabled() -> bool:
+    if _deploy_safe_mode():
+        return False
     if not _vision_api_configured():
         return False
     return os.environ.get("BALLOON_REGION_PREPASS", "1").strip().lower() not in (
@@ -1670,6 +1673,8 @@ def _region_prepass_enabled() -> bool:
 
 
 def _opencv_dim_detect_enabled() -> bool:
+    if _deploy_safe_mode():
+        return False
     return os.environ.get("BALLOON_OPENCV_DIM_LINES", "1").strip().lower() not in (
         "0",
         "false",
@@ -1867,6 +1872,29 @@ def _offset_vision_detections_to_full(
         nd["region_offset"] = [ox, oy]
         out.append(nd)
     return out
+
+
+def _deploy_safe_mode() -> bool:
+    """
+    Render / small instances: skip slow Claude grid passes and cap per-crop OCR
+    to avoid HTTP 502 (proxy timeout or OOM). Set BALLOON_RENDER_SAFE=0 to disable.
+    """
+    explicit = os.environ.get("BALLOON_RENDER_SAFE", "").strip().lower()
+    if explicit in ("0", "false", "no", "off"):
+        return False
+    if explicit in ("1", "true", "yes", "on"):
+        return True
+    return os.environ.get("RENDER", "").strip().lower() in ("true", "1")
+
+
+def _max_crop_ocr_count() -> int:
+    raw = os.environ.get("BALLOON_MAX_CROP_OCR", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return 30 if _deploy_safe_mode() else 99999
 
 
 def _vision_fallback_mode() -> str:
@@ -2314,6 +2342,11 @@ def _apply_vision_fallback_if_needed(payload: dict) -> None:
     - Anthropic scans the full drawing grid-wise and adds ONLY missed callouts
       (horizontal + vertical dimensions), never duplicating existing YOLO boxes.
     """
+    if _deploy_safe_mode():
+        payload["vision_fallback_skipped"] = "render_safe_mode"
+        payload["detection_pipeline"] = "yolo"
+        payload["pipeline_logic"] = "yolo_render_safe"
+        return
     mode = _vision_fallback_mode()
     if mode in ("never", "0", "false", "off", "yolo_only", "yolo-only"):
         payload["detection_pipeline"] = "yolo"
@@ -2435,6 +2468,8 @@ def _apply_vision_fallback_if_needed(payload: dict) -> None:
 
 
 def _coverage_verify_enabled() -> bool:
+    if _deploy_safe_mode():
+        return False
     return os.environ.get("BALLOON_COVERAGE_VERIFY", "1").strip().lower() not in (
         "0",
         "false",
@@ -3715,6 +3750,9 @@ def _extract_detection_text_llm(image_path: str, detections: list) -> list:
         return []
     h, w = img.shape[:2]
     items = []
+    max_ocr = _max_crop_ocr_count()
+    if _deploy_safe_mode():
+        print(f"[detect] Render safe mode: OCR on first {max_ocr} crops only (set BALLOON_MAX_CROP_OCR).")
     for i, d in enumerate(detections or [], start=1):
         bb = d.get("bbox") or []
         if len(bb) < 4:
@@ -3744,9 +3782,10 @@ def _extract_detection_text_llm(image_path: str, detections: list) -> list:
             "inspection_method": "",
             "remarks": "",
         }
-        if _ocr_engine() == "claude":
+        run_ocr = i <= max_ocr
+        if run_ocr and _ocr_engine() == "claude":
             parsed = _ocr_first_parse_crop(crop, cls, dim_ori)
-        else:
+        elif run_ocr:
             ok, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
             if ok:
                 try:
@@ -3803,6 +3842,8 @@ def _extract_detection_text_llm(image_path: str, detections: list) -> list:
 
 
 def _full_drawing_analysis_enabled() -> bool:
+    if _deploy_safe_mode():
+        return False
     return os.environ.get("BALLOON_FULL_DRAWING_ANALYSIS", "").strip().lower() in (
         "1",
         "true",
