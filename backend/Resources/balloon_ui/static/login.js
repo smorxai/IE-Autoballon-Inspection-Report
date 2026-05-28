@@ -50,13 +50,22 @@
     var btn = this;
     btn.disabled = true;
     btn.textContent = "Logging in…";
-    var res = await apiPost("/auth/login", { login: login, password: password });
+    var res;
+    try {
+      res = await apiPost("/auth/login", { login: login, password: password });
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = "Log in";
+      show("Cannot reach server. Wait for Render to wake up, then try again.");
+      return;
+    }
     btn.disabled = false;
     btn.textContent = "Log in";
 
     if (!res.ok) {
-      if (BalloonAuth.redirectFromAuthError(res.status, res.data)) return;
-      show(BalloonAuth.extractError(res.data));
+      /* Do not redirect to /login on 401 — that reloads the page and hides the error. */
+      if (res.status !== 401 && BalloonAuth.redirectFromAuthError(res.status, res.data)) return;
+      show(BalloonAuth.extractError(res.data) || "Login failed.");
       return;
     }
 
