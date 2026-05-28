@@ -108,6 +108,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _migrate_schema()
     _seed_super_admin()
+    _sync_super_admin_password_from_env()
 
 
 def _migrate_schema() -> None:
