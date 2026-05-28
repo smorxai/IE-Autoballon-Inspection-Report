@@ -203,6 +203,17 @@ def _startup():
         return
     if auth_enabled():
         print(f"[auth] Authentication ENABLED — {trial_days()}-day organization trial, then Razorpay payment.")
+    if _deploy_safe_mode():
+        print(
+            "[detect] Render safe mode ON — YOLO only + limited crop OCR "
+            f"(engine={_ocr_engine()}, max={_max_crop_ocr_count()}). "
+            "Set BALLOON_RENDER_SAFE=0 for full Claude pipeline."
+        )
+        try:
+            _tasks().get_yolo_model()
+            print("[detect] YOLO model preloaded.")
+        except Exception as exc:
+            print(f"[detect] YOLO preload skipped: {exc}")
 
 _STATIC_DIR = _UI_DIR / "static"
 if _STATIC_DIR.is_dir():
@@ -1684,12 +1695,14 @@ def _opencv_dim_detect_enabled() -> bool:
 
 
 def _ocr_engine() -> str:
-    """claude (default when API key) | tesseract."""
+    """claude (default when API key) | tesseract. Render safe mode defaults to tesseract (fast, no API)."""
     raw = os.environ.get("BALLOON_OCR_ENGINE", "").strip().lower()
     if raw in ("tesseract", "tess", "local"):
         return "tesseract"
     if raw in ("claude", "anthropic", "vision"):
         return "claude"
+    if _deploy_safe_mode():
+        return "tesseract"
     return "claude" if _vision_api_configured() else "tesseract"
 
 
@@ -1891,10 +1904,13 @@ def _max_crop_ocr_count() -> int:
     raw = os.environ.get("BALLOON_MAX_CROP_OCR", "").strip()
     if raw:
         try:
-            return max(1, int(raw))
+            return max(0, int(raw))
         except ValueError:
             pass
-    return 30 if _deploy_safe_mode() else 99999
+    if _deploy_safe_mode():
+        # Claude per-crop OCR is the main cause of Render HTTP 502 (proxy timeout).
+        return 6 if _ocr_engine() == "claude" else 80
+    return 99999
 
 
 def _vision_fallback_mode() -> str:
@@ -3595,7 +3611,8 @@ def _extract_title_block_meta(image_path: str, detections: list) -> dict[str, st
 
     parsed: dict[str, str] = {}
     for crop in crops:
-        parsed = _merge_title_meta(parsed, _vision_title_block_json(crop))
+        if not _deploy_safe_mode():
+            parsed = _merge_title_meta(parsed, _vision_title_block_json(crop))
         ocr_text = _ocr_text_from_bgr(crop)
         if ocr_text:
             parsed = _merge_title_meta(parsed, _title_block_meta_from_text(ocr_text))
@@ -3782,27 +3799,9 @@ def _extract_detection_text_llm(image_path: str, detections: list) -> list:
             "inspection_method": "",
             "remarks": "",
         }
-        run_ocr = i <= max_ocr
-        if run_ocr and _ocr_engine() == "claude":
+        run_ocr = max_ocr <= 0 or i <= max_ocr
+        if run_ocr:
             parsed = _ocr_first_parse_crop(crop, cls, dim_ori)
-        elif run_ocr:
-            ok, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-            if ok:
-                try:
-                    val = _tasks()._vision_llm_message(
-                        buf.tobytes(),
-                        _balloon_vision_prompt(cls),
-                        max_tokens=int(os.environ.get("BALLOON_CROP_MAX_TOKENS", "800")),
-                        temperature=0.0,
-                        top_p=1.0,
-                    )
-                    parsed = _enrich_extraction_from_ocr(
-                        _parse_extraction_json(val or ""), crop, cls, dim_ori
-                    )
-                except Exception:
-                    parsed = _enrich_extraction_from_ocr(parsed, crop, cls, dim_ori)
-            else:
-                parsed = _enrich_extraction_from_ocr(parsed, crop, cls, dim_ori)
         nominal_value = parsed["nominal_value"]
         tolerance = parsed["tolerance"]
         others = parsed["others"]
@@ -3977,6 +3976,50 @@ def api_auth_config():
     }
 
 
+def _run_detection_pipeline(dest_path: str, work_dir: str, filename: str) -> tuple[dict | None, str | None]:
+    """Heavy sync pipeline (YOLO + optional Claude). Runs in a worker thread on Render."""
+    payload, err = _tasks().run_drawing_yolo_detection(dest_path, work_dir, filename)
+    if err:
+        return None, err
+
+    payload["yolo_raw_count"] = payload.get("yolo_raw_count") or payload.get("count")
+    _filter_detection_payload(payload)
+    _mark_yolo_detection_sources(payload)
+    payload["yolo_after_filter_count"] = payload.get("count")
+    payload["pipeline_stage"] = "yolo_complete"
+    _anthropic_region_prepass(payload)
+    _opencv_dim_line_stage(payload)
+    _apply_vision_fallback_if_needed(payload)
+    _anthropic_coverage_verify(payload)
+    _refine_dimension_detection_payload(payload)
+    _reorder_detection_payload_tblr(payload)
+    dets = payload.get("detections") or []
+    payload["drawing_annotations"] = _drawing_annotations_from_detections(dets)
+    extract_path = payload.get("infer_image_path") or dest_path
+    dets_for_crop = payload.get("detections_full") or dets
+    payload["balloon_items"] = _extract_detection_text_llm(extract_path, dets_for_crop)
+    _expand_multiplier_balloons_payload(payload)
+    _remove_duplicate_yolo_detections_near_multiplier(payload)
+    _repair_multiplier_drawing_annotations(payload)
+    if _balloon_placement_mode() in ("legacy", "autoballoon", "grid"):
+        _apply_legacy_balloon_coordinates(payload, extract_path)
+    else:
+        payload["balloon_placement"] = "tight"
+    _sync_balloon_items_from_detections(payload)
+    _hide_incomplete_balloons(payload)
+    payload["balloon_pipeline_complete"] = True
+    payload["title_block_meta"] = _extract_title_block_meta(extract_path, dets_for_crop)
+    payload["extraction_prompt"] = (
+        "yolo_render_safe" if _deploy_safe_mode() else "yolo_balloons_then_claude_grid_gap_fill_ocr"
+    )
+    payload["render_safe_mode"] = _deploy_safe_mode()
+    payload["show_detection_boxes"] = False
+    if _full_drawing_analysis_enabled():
+        _apply_full_drawing_balloon_analysis(payload, extract_path)
+    payload["weights_path"] = _tasks().get_yolo_weights_path_loaded()
+    return payload, None
+
+
 @app.post("/api/v1/detect")
 async def api_detect(
     file: UploadFile = File(...),
@@ -4000,51 +4043,21 @@ async def api_detect(
         with dest.open("wb") as buf:
             shutil.copyfileobj(file.file, buf)
 
-        payload, err = _tasks().run_drawing_yolo_detection(str(dest), str(work), file.filename)
+        try:
+            payload, err = await asyncio.to_thread(
+                _run_detection_pipeline, str(dest), str(work), file.filename
+            )
+        except Exception as exc:
+            print(f"[detect] Pipeline failed: {exc}")
+            return JSONResponse(
+                status_code=500,
+                content={"ok": False, "error": f"Detection failed: {exc}"[:500]},
+            )
+
         if err:
             return JSONResponse(status_code=400, content={"ok": False, "error": err})
 
-        payload["yolo_raw_count"] = payload.get("yolo_raw_count") or payload.get("count")
-        # ── Stage 1: YOLO detection (balloon base) ───────────────────────────
-        _filter_detection_payload(payload)
-        _mark_yolo_detection_sources(payload)
-        payload["yolo_after_filter_count"] = payload.get("count")
-        payload["pipeline_stage"] = "yolo_complete"
-        # ── Region pre-pass (Claude view segmentation) ───────────────────────
-        _anthropic_region_prepass(payload)
-        # ── OpenCV dim-line candidates ─────────────────────────────────────
-        _opencv_dim_line_stage(payload)
-        # ── Stage 2: Anthropic grid gap-fill (missed dims only, no duplicates) ─
-        _apply_vision_fallback_if_needed(payload)
-        _anthropic_coverage_verify(payload)
-        # ── Stage 3: internal bbox refine + balloons + OCR text ──────────────
-        _refine_dimension_detection_payload(payload)
-        _reorder_detection_payload_tblr(payload)
         dets = payload.get("detections") or []
-        payload["drawing_annotations"] = _drawing_annotations_from_detections(dets)
-        # Same raster file YOLO used (do not call PdfToPreprocessedImage twice — can desync pixels vs boxes).
-        extract_path = payload.get("infer_image_path") or str(dest)
-        # Use full-resolution bboxes for crops (detections may be scaled for preview only).
-        dets_for_crop = payload.get("detections_full") or dets
-        payload["balloon_items"] = _extract_detection_text_llm(extract_path, dets_for_crop)
-        _expand_multiplier_balloons_payload(payload)
-        _remove_duplicate_yolo_detections_near_multiplier(payload)
-        _repair_multiplier_drawing_annotations(payload)
-        if _balloon_placement_mode() in ("legacy", "autoballoon", "grid"):
-            _apply_legacy_balloon_coordinates(payload, extract_path)
-        else:
-            payload["balloon_placement"] = "tight"
-        _sync_balloon_items_from_detections(payload)
-        _hide_incomplete_balloons(payload)
-        payload["balloon_pipeline_complete"] = True
-        payload["title_block_meta"] = _extract_title_block_meta(extract_path, dets_for_crop)
-        payload["extraction_prompt"] = "yolo_balloons_then_claude_grid_gap_fill_ocr"
-        payload["show_detection_boxes"] = False
-        if _full_drawing_analysis_enabled():
-            _apply_full_drawing_balloon_analysis(payload, extract_path)
-        payload["weights_path"] = _tasks().get_yolo_weights_path_loaded()
-
-        # ── Activity log (tenant-scoped) ──────────────────────────────────
         _log_activity(
             pg,
             current_user,

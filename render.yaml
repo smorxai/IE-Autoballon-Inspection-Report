@@ -8,3 +8,9 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.10.11"
+      - key: BALLOON_RENDER_SAFE
+        value: "1"
+      - key: BALLOON_OCR_ENGINE
+        value: tesseract
+      - key: BALLOON_MAX_CROP_OCR
+        value: "40"
