@@ -190,3 +190,46 @@ def _seed_super_admin() -> None:
         print(f"[auth] WARNING: Could not seed super admin: {exc}")
     finally:
         db.close()
+
+
+def _sync_super_admin_password_from_env() -> None:
+    """
+    One-time recovery: set BALLOON_RESET_SUPER_ADMIN_PASSWORD=1 on Render with
+    SUPER_ADMIN_PASSWORD, redeploy, log in, then remove the flag.
+    """
+    flag = os.environ.get("BALLOON_RESET_SUPER_ADMIN_PASSWORD", "").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        return
+    raw_password = os.environ.get("SUPER_ADMIN_PASSWORD", "").strip()
+    if not raw_password:
+        print("[auth] BALLOON_RESET_SUPER_ADMIN_PASSWORD=1 but SUPER_ADMIN_PASSWORD is empty — skipped.")
+        return
+
+    from auth.models import RoleEnum, User
+    from auth.utils import hash_password
+
+    email = os.environ.get("SUPER_ADMIN_EMAIL", "admin@smorx.ai").strip().lower()
+    db = SessionLocal()
+    try:
+        admin = db.query(User).filter_by(role=RoleEnum.super_admin).first()
+        if not admin:
+            admin = db.query(User).filter(User.email == email).first()
+        if not admin:
+            print(f"[auth] Password reset skipped — no user for {email}")
+            return
+        admin.password_hash = hash_password(raw_password)
+        admin.is_temp_password = False
+        admin.email_verified = True
+        admin.is_active = True
+        if not (admin.username or "").strip():
+            admin.username = "superadmin"
+        db.commit()
+        print(
+            f"[auth] Super admin password reset from env for {admin.email} — "
+            "remove BALLOON_RESET_SUPER_ADMIN_PASSWORD after login."
+        )
+    except Exception as exc:
+        db.rollback()
+        print(f"[auth] WARNING: Super admin password reset failed: {exc}")
+    finally:
+        db.close()
