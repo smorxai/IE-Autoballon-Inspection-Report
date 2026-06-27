@@ -120,6 +120,11 @@ PATTERNS TO RECOGNIZE (any digits/letters that fit the pattern):
 
 14. COMMA DECIMAL (ISO): in ANY numeric pattern above, comma is decimal separator (30,5 → 30.5).
 
+15. IGNORE — EXISTING PART / BOM BALLOONS (do NOT balloon, do NOT OCR as dimension):
+    Small circle containing ONLY an item/part number (e.g. 2, 20, 21) with a leader line
+    pointing to an assembly component. These are drawing symbols for parts lists, NOT
+    inspection dimensions. Skip entirely — never assign a new balloon or extract nominal.
+
 Always transcribe EXACTLY what is printed. Apply the matching pattern; do not substitute example numbers.
 """
 
@@ -140,7 +145,8 @@ def report_integrity_pattern_rules() -> str:
         "- Metadata: drawing/part/rev/change/mass/date — any readable code.\n"
         "- Mass: = <number> = pattern.\n"
         "- Comma decimals: treat as dot in nominal/tolerance.\n"
-        "REJECT only: empty rows, lone X/Y/Z, SECTION/DETAIL labels with no value, geometry with no text.\n"
+        "REJECT only: empty rows, lone X/Y/Z, SECTION/DETAIL labels with no value, geometry with no text, "
+        "existing part/BOM item balloons (numbered circle + leader — symbol only, not a dimension).\n"
     )
 
 
@@ -167,6 +173,8 @@ def crop_extraction_prompt(class_name: str, orientation: str = "") -> str:
         "- Do NOT invent dimensions, tolerances, view names, or inspection methods.\n"
         "- If text is unclear, use empty strings — never guess.\n"
         "- Do NOT add metadata not visible in the crop (no 'Front View' unless written).\n"
+        "- If the crop is an EXISTING part/BOM balloon (circle with ONLY an item number like 2, 20, 21 "
+        "and a leader line) — NOT a dimension — return empty strings for all fields.\n"
         "- Preserve symbols exactly: Ø, ±, °, R, 2X, THRU, H7, C, ×.\n\n"
         f"{CALLOUT_PATTERN_RULES}\n\n"
         'Return ONLY valid JSON (no markdown):\n'
@@ -259,6 +267,8 @@ def anthropic_gap_fill_after_yolo_prompt(
         "- Return ONLY new callouts not covered by YOLO.\n"
         "- Box tight around readable TEXT/SYMBOLS only (not bare extension lines).\n"
         "- Do NOT invent values or boxes. If unsure, omit.\n"
+        "- IGNORE existing part/BOM balloons: numbered circles (item 2, 20, 21…) with leader lines "
+        "to components — symbols only, NOT dimensions. Never add a box on them.\n"
         "- confidence \"high\" only when digits/symbols are clearly readable.\n"
         "- NOTES: one box for full notes block if missing. Title block / revision: one box each if missing.\n"
         "- Detect by PATTERN not fixed numbers: weld a<any>, Ra<any>, Ø<any>, (N)X, (<num>), = <num> =, etc.\n\n"
@@ -334,6 +344,7 @@ def gpt_cross_check_audit_prompt(
         "   Never skip readable text because of rotation or because the number differs from examples.\n\n"
         "B) FALSE / EXTRA — listed boxes that do NOT contain a real callout:\n"
         "   e.g. empty whitespace, bare geometry/extension lines with no text, hatching,\n"
+        "   existing part/BOM item balloons (numbered circle + leader to component — symbol only),\n"
         "   or an exact duplicate box on the SAME callout as another listed box.\n\n"
         "EXISTING BALLOON BOXES (#index class [x1,y1,x2,y2] in this image's pixel space):\n"
         f"{balloon_boxes_text or '  (none)'}\n\n"

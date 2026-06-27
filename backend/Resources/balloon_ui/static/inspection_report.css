@@ -272,6 +272,30 @@
   text-align: center;
 }
 
+.ir-table select.ir-select {
+  width: 100%;
+  min-width: 5.5rem;
+  max-width: 11rem;
+  padding: 0.28rem 0.35rem;
+  border: 1px solid #94a3b8;
+  border-radius: 3px;
+  font-size: 0.75rem;
+  background: #fff;
+  text-align: center;
+  cursor: pointer;
+}
+
+.ir-table select.ir-select:disabled {
+  background: #f1f5f9;
+  color: #64748b;
+  cursor: not-allowed;
+}
+
+.ir-table td:has(select[data-field="unit"]) select.ir-select {
+  min-width: 3.5rem;
+  max-width: 5rem;
+}
+
 .ir-measured-cell {
   display: flex;
   align-items: center;

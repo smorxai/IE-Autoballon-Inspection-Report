@@ -253,6 +253,7 @@ class InspectionReportRow(BaseModel):
     tol_low: str = ""
     tol_high: str = ""
     instrument: str = ""
+    unit: str = ""
     instrument_id: str = ""
     measured: list[str] = Field(default_factory=list)
     remarks: str = ""
@@ -353,6 +354,7 @@ def _build_inspection_report_pdf(body: InspectionReportExportBody) -> bytes:
         "Tol (low)",
         "Tol (high)",
         "Instrument",
+        "Unit",
         "Instr. ID",
     ]
     for c in range(meas_n):
@@ -369,6 +371,7 @@ def _build_inspection_report_pdf(body: InspectionReportExportBody) -> bytes:
             cell(_fmt_tol_pdf(row.tol_low)),
             cell(_fmt_tol_pdf(row.tol_high)),
             cell(row.instrument),
+            cell(row.unit),
             cell(row.instrument_id),
         ]
         measured = row.measured or []
@@ -378,12 +381,27 @@ def _build_inspection_report_pdf(body: InspectionReportExportBody) -> bytes:
         table_data.append(cells)
 
     usable_w = page[0] - doc.leftMargin - doc.rightMargin
-    base_cols = 8
+    base_cols = 9
     extra = meas_n + 1
     w_sno, w_balloon, w_ref = 0.35, 0.55, 0.75
     w_nom, w_tol = 0.55, 0.5
-    w_inst, w_inst_id = 0.65, 0.65
-    w_meas = max(0.55, (usable_w / inch - w_sno - w_balloon - w_ref - w_nom - 2 * w_tol - w_inst - w_inst_id - 0.9) / meas_n)
+    w_inst, w_unit, w_inst_id = 0.65, 0.4, 0.6
+    w_meas = max(
+        0.55,
+        (
+            usable_w / inch
+            - w_sno
+            - w_balloon
+            - w_ref
+            - w_nom
+            - 2 * w_tol
+            - w_inst
+            - w_unit
+            - w_inst_id
+            - 0.9
+        )
+        / meas_n,
+    )
     col_widths = [
         w_sno * inch,
         w_balloon * inch,
@@ -392,6 +410,7 @@ def _build_inspection_report_pdf(body: InspectionReportExportBody) -> bytes:
         w_tol * inch,
         w_tol * inch,
         w_inst * inch,
+        w_unit * inch,
         w_inst_id * inch,
     ]
     col_widths.extend([w_meas * inch] * meas_n)
@@ -406,7 +425,7 @@ def _build_inspection_report_pdf(body: InspectionReportExportBody) -> bytes:
                 ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#d4e8f7")]),
                 ("BOX", (0, 0), (-1, -1), 0.75, colors.HexColor("#7eb8dc")),
                 ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#7eb8dc")),
-                ("LINEAFTER", (7, 0), (7, -1), 1.5, colors.HexColor("#e07a2f")),
+                ("LINEAFTER", (8, 0), (8, -1), 1.5, colors.HexColor("#e07a2f")),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("ALIGN", (0, 0), (-1, -1), "CENTER"),
                 ("FONTSIZE", (0, 0), (-1, -1), 7),
@@ -1193,7 +1212,171 @@ def _is_spurious_detection_medium(
         return True
     if _is_vision_sourced(d) and cls == "Miscellaneous" and area_frac > 0.004 and conf < 0.6:
         return True
+    if gray is not None and _bbox_looks_like_part_balloon_circle(gray, x1, y1, x2, y2):
+        if max(bw, bh) <= 120 and aspect <= 1.38:
+            return True
     return False
+
+
+def _part_balloon_plain_integer_text(text: str) -> bool:
+    """True when OCR is only a short item/part index (2, 20, 21) — not a dimension callout."""
+    raw = re.sub(r"\s+", "", (text or "").strip())
+    if not raw:
+        return False
+    if re.search(r"[±ØøΦφ⌀∅°]", raw):
+        return False
+    if re.search(r"[.,]", raw):
+        return False
+    if re.fullmatch(r"[Rr]\d+", raw):
+        return False
+    digits = re.sub(r"[^\d]", "", raw)
+    return bool(digits) and re.fullmatch(r"\d{1,4}", digits)
+
+
+def _bbox_looks_like_part_balloon_circle(
+    gray: np.ndarray, x1: int, y1: int, x2: int, y2: int
+) -> bool:
+    """Detect circle outline typical of BOM/part item balloons on assembly drawings."""
+    bw = x2 - x1
+    bh = y2 - y1
+    if bw < 10 or bh < 10 or bw > 200 or bh > 200:
+        return False
+    aspect = max(bw, bh) / max(1, min(bw, bh))
+    if aspect > 1.4:
+        return False
+
+    h_img, w_img = gray.shape[:2]
+    x1c = max(0, x1)
+    y1c = max(0, y1)
+    x2c = min(w_img, x2)
+    y2c = min(h_img, y2)
+    roi = gray[y1c:y2c, x1c:x2c]
+    if roi.size == 0:
+        return False
+
+    side = max(roi.shape[:2])
+    sc = 80.0 / side
+    rs_w = max(18, int(roi.shape[1] * sc))
+    rs_h = max(18, int(roi.shape[0] * sc))
+    small = cv2.resize(roi, (rs_w, rs_h), interpolation=cv2.INTER_AREA)
+    blur = cv2.GaussianBlur(small, (5, 5), 1.2)
+
+    min_r = int(min(rs_w, rs_h) * 0.26)
+    max_r = int(min(rs_w, rs_h) * 0.54)
+    circles = cv2.HoughCircles(
+        blur,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=max(10, min_r),
+        param1=60,
+        param2=22,
+        minRadius=max(5, min_r),
+        maxRadius=max(min_r + 2, max_r),
+    )
+    if circles is not None and len(circles[0]) > 0:
+        return True
+
+    _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(th, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < 60 or area > (rs_w * rs_h * 0.82):
+            continue
+        peri = cv2.arcLength(c, True)
+        if peri < 1:
+            continue
+        circ = 4 * math.pi * area / (peri * peri)
+        if circ > 0.70:
+            return True
+    return False
+
+
+def _is_part_item_balloon_symbol(
+    det: dict | None,
+    items: list,
+    gray: np.ndarray | None,
+) -> bool:
+    """
+    Existing BOM/part balloon on drawing: numbered circle + leader to component.
+    Not an inspection dimension — skip auto-ballooning.
+    """
+    bb = (det or {}).get("bbox") or []
+    if len(bb) < 4 or gray is None:
+        return False
+    x1, y1, x2, y2 = int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3])
+    if not _bbox_looks_like_part_balloon_circle(gray, x1, y1, x2, y2):
+        return False
+
+    chunks: list[str] = []
+    for it in items or []:
+        for key in ("nominal_value", "tolerance", "others", "raw_ocr", "detected_text"):
+            v = str((it or {}).get(key) or "").strip()
+            if v:
+                chunks.append(v)
+    combined = " ".join(chunks).strip()
+    if combined:
+        for it in items or []:
+            tol = str((it or {}).get("tolerance") or "").strip()
+            if tol and re.search(r"\d", tol):
+                return False
+        if not _part_balloon_plain_integer_text(combined):
+            return False
+    return True
+
+
+def _load_infer_gray(payload: dict) -> np.ndarray | None:
+    infer_path = payload.get("infer_image_path")
+    if not infer_path or not Path(str(infer_path)).is_file():
+        return None
+    return cv2.imread(str(infer_path), cv2.IMREAD_GRAYSCALE)
+
+
+def _drop_part_item_balloon_symbols(payload: dict) -> None:
+    """Remove existing part/BOM numbered-circle balloons from detections and table."""
+    items = list(payload.get("balloon_items") or [])
+    dets = list(payload.get("detections") or [])
+    full = list(payload.get("detections_full") or [])
+    if not dets:
+        return
+    gray = _load_infer_gray(payload)
+    if gray is None:
+        return
+
+    by_di: dict[int, list] = {}
+    for it in items:
+        di = it.get("detection_index")
+        if isinstance(di, int):
+            by_di.setdefault(di, []).append(it)
+
+    keep: list[int] = []
+    dropped = 0
+    for i in range(len(dets)):
+        group = by_di.get(i, [])
+        if _is_part_item_balloon_symbol(dets[i], group, gray):
+            dropped += 1
+            continue
+        keep.append(i)
+    if dropped == 0:
+        return
+
+    remap = {old: new for new, old in enumerate(keep)}
+    payload["detections"] = [dets[i] for i in keep]
+    if len(full) == len(dets):
+        payload["detections_full"] = [full[i] for i in keep]
+    new_items: list = []
+    for it in items:
+        di = it.get("detection_index")
+        if not isinstance(di, int) or di not in remap:
+            continue
+        row = dict(it)
+        row["detection_index"] = remap[di]
+        row["balloon_number"] = remap[di] + 1
+        new_items.append(row)
+    payload["balloon_items"] = new_items
+    payload["drawing_annotations"] = _drawing_annotations_from_detections(payload["detections"])
+    payload["count"] = len(payload["detections"])
+    payload["part_balloons_dropped"] = dropped
+    print(f"[detect] Ignored {dropped} existing part/BOM balloon symbol(s) (numbered circles).")
 
 
 def _boxes_are_distinct_dimensions(d_i: dict, d_j: dict) -> bool:
@@ -4417,11 +4600,17 @@ def _drop_empty_value_detections(payload: dict) -> None:
         if isinstance(di, int):
             by_di.setdefault(di, []).append(it)
 
+    gray = _load_infer_gray(payload)
+
     keep: list[int] = []
     dropped_validity = 0
     dropped_geometry = 0
+    dropped_part = 0
     for i in range(len(dets)):
         group = by_di.get(i, [])
+        if gray is not None and _is_part_item_balloon_symbol(dets[i], group, gray):
+            dropped_part += 1
+            continue
         read_attempted = any(it.get("text_read_attempted", True) for it in group)
         if not read_attempted:
             keep.append(i)
@@ -4467,9 +4656,11 @@ def _drop_empty_value_detections(payload: dict) -> None:
     payload["balloons_dropped_no_data"] = dropped
     payload["balloons_dropped_validity"] = dropped_validity
     payload["balloons_dropped_geometry"] = dropped_geometry
+    payload["part_balloons_dropped"] = int(payload.get("part_balloons_dropped") or 0) + dropped_part
     print(
         f"[detect] Quality filter: dropped {dropped} balloon(s) "
-        f"(validity={dropped_validity}, geometry={dropped_geometry}); "
+        f"(validity={dropped_validity}, geometry={dropped_geometry}, "
+        f"part_symbols={dropped_part}); "
         f"renumbered 1..{len(keep)}."
     )
 
@@ -5221,6 +5412,8 @@ def _run_detection_pipeline(dest_path: str, work_dir: str, filename: str) -> tup
         payload["balloon_items"] = associate_features(normalized)
     except Exception as exc:
         payload["ocr_normalize_error"] = str(exc)[:200]
+    # Drop existing part/BOM numbered-circle balloons (assembly item symbols, not dimensions).
+    _drop_part_item_balloon_symbols(payload)
     # Post-OCR: validity (must have number, reject X/Y/Z, SECTION/DETAIL, empty)
     # + geometry false-positive filter, then renumber 1..n.
     _drop_empty_value_detections(payload)

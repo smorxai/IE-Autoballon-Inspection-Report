@@ -4,6 +4,44 @@
   const MIN_MEASURED_COLS = 1;
   const DEFAULT_MEASURED_COLS = 3;
 
+  const INSTRUMENT_OPTIONS = [
+    "Vernier Caliper",
+    "Digital Vernier Caliper",
+    "Micrometer",
+    "Height Gauge",
+    "Dial Indicator",
+    "Bore Gauge",
+    "CMM",
+    "Vision Inspection System",
+    "Laser Scanner",
+    "Measuring Tape",
+  ];
+
+  /** Units available per instrument (dropdown when more than one). */
+  const INSTRUMENT_UNITS = {
+    "Vernier Caliper": ["mm", "in"],
+    "Digital Vernier Caliper": ["mm", "in"],
+    "Micrometer": ["mm", "μm", "in"],
+    "Height Gauge": ["mm", "in"],
+    "Dial Indicator": ["mm", "in"],
+    "Bore Gauge": ["mm", "in"],
+    "CMM": ["mm", "in"],
+    "Vision Inspection System": ["mm", "in", "deg"],
+    "Laser Scanner": ["mm", "in"],
+    "Measuring Tape": ["mm", "m", "in", "ft"],
+  };
+
+  function unitsForInstrument(instrument) {
+    return INSTRUMENT_UNITS[instrument] || [];
+  }
+
+  function defaultUnitForInstrument(instrument, current) {
+    const units = unitsForInstrument(instrument);
+    if (!units.length) return "";
+    if (current && units.indexOf(current) >= 0) return current;
+    return units.length === 1 ? units[0] : "";
+  }
+
   const irEmpty = document.getElementById("irEmpty");
   const irContent = document.getElementById("irContent");
   const irThead = document.getElementById("irThead");
@@ -141,6 +179,7 @@
         tolLow: parsed.tolLow,
         tolHigh: parsed.tolHigh,
         instrument: "",
+        unit: "",
         instrumentId: "",
         measured: measured,
         remarks: "",
@@ -183,7 +222,7 @@
   }
 
   function renderHeader() {
-    const accSpan = 8;
+    const accSpan = 9;
     const measSpan = measuredColCount + 1;
     let html =
       "<tr>" +
@@ -204,6 +243,7 @@
       "<th>Tol (low)</th>" +
       "<th>Tol (high)</th>" +
       "<th>Instrument</th>" +
+      "<th>Unit</th>" +
       '<th class="ir-col-accountability">Instrument ID</th>';
 
     for (let c = 0; c < measuredColCount; c++) {
@@ -224,8 +264,56 @@
     }
   }
 
+  function instrumentSelectHtml(row, rowIdx) {
+    let html = '<td><select class="ir-select" data-field="instrument" data-row="' + rowIdx + '">';
+    html += '<option value="">—</option>';
+    INSTRUMENT_OPTIONS.forEach(function (name) {
+      const sel = row.instrument === name ? " selected" : "";
+      html += '<option value="' + escAttr(name) + '"' + sel + ">" + escHtml(name) + "</option>";
+    });
+    html += "</select></td>";
+    return html;
+  }
+
+  function unitSelectHtml(row, rowIdx) {
+    const units = unitsForInstrument(row.instrument);
+    let html = '<td><select class="ir-select" data-field="unit" data-row="' + rowIdx + '"';
+    if (!units.length) html += " disabled";
+    html += ">";
+    if (!units.length) {
+      html += '<option value="">—</option>';
+    } else if (units.length === 1) {
+      html += '<option value="' + escAttr(units[0]) + '" selected>' + escHtml(units[0]) + "</option>";
+    } else {
+      html += '<option value="">—</option>';
+      units.forEach(function (u) {
+        const sel = row.unit === u ? " selected" : "";
+        html += '<option value="' + escAttr(u) + '"' + sel + ">" + escHtml(u) + "</option>";
+      });
+    }
+    html += "</select></td>";
+    return html;
+  }
+
+  function updateUnitSelect(rowIdx) {
+    const tr = irTbody.children[rowIdx];
+    const row = rows[rowIdx];
+    if (!tr || !row) return;
+    const unitSelect = tr.querySelector('select[data-field="unit"]');
+    if (!unitSelect || !unitSelect.parentElement) return;
+    row.unit = defaultUnitForInstrument(row.instrument, row.unit);
+    unitSelect.parentElement.outerHTML = unitSelectHtml(row, rowIdx);
+    const newSel = tr.querySelector('select[data-field="unit"]');
+    if (newSel) newSel.addEventListener("change", onRowInput);
+  }
+
   function renderBody() {
     irTbody.innerHTML = "";
+    rows.forEach(function (row) {
+      if (row.instrument) {
+        row.unit = defaultUnitForInstrument(row.instrument, row.unit);
+      }
+    });
     if (!rows.length) {
       const tr = document.createElement("tr");
       tr.innerHTML =
@@ -245,7 +333,8 @@
         '<td><span class="ir-readonly">' + escHtml(row.nominal || "—") + "</span></td>" +
         '<td><span class="ir-readonly">' + escHtml(formatTolDisplay(row.tolLow)) + "</span></td>" +
         '<td><span class="ir-readonly">' + escHtml(formatTolDisplay(row.tolHigh)) + "</span></td>" +
-        '<td><input type="text" data-field="instrument" data-row="' + rowIdx + '" value="' + escAttr(row.instrument) + '" /></td>' +
+        instrumentSelectHtml(row, rowIdx) +
+        unitSelectHtml(row, rowIdx) +
         '<td><input type="text" data-field="instrumentId" data-row="' + rowIdx + '" value="' + escAttr(row.instrumentId) + '" /></td>';
 
       for (let c = 0; c < measuredColCount; c++) {
@@ -293,7 +382,7 @@
   }
 
   function bindRowInputs() {
-    irTbody.querySelectorAll("input").forEach(function (inp) {
+    irTbody.querySelectorAll("input, select").forEach(function (inp) {
       inp.addEventListener("input", onRowInput);
       inp.addEventListener("change", onRowInput);
     });
@@ -307,7 +396,11 @@
     const row = rows[rowIdx];
 
     if (field === "reference") row.referenceLocation = inp.value;
-    else if (field === "instrument") row.instrument = inp.value;
+    else if (field === "instrument") {
+      row.instrument = inp.value;
+      row.unit = defaultUnitForInstrument(row.instrument, row.unit);
+      updateUnitSelect(rowIdx);
+    } else if (field === "unit") row.unit = inp.value;
     else if (field === "instrumentId") row.instrumentId = inp.value;
     else if (field === "remarks") row.remarks = inp.value;
     else if (field === "measured") {
@@ -377,6 +470,7 @@
           tol_low: formatTolDisplay(row.tolLow),
           tol_high: formatTolDisplay(row.tolHigh),
           instrument: row.instrument || "",
+          unit: row.unit || "",
           instrument_id: row.instrumentId || "",
           measured: row.measured.slice(),
           remarks: row.remarks || "",

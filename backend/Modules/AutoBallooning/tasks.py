@@ -206,7 +206,7 @@ def _dimension_extraction_prompt_template() -> str:
 You are an expert at extracting dimensional info, GD&T symbols, and notes from engineering drawings and structuring them in a detailed format.
 
 ## Rules:
-1. IGNORE red balloon numbers – they are only pointers.
+1. IGNORE existing balloon circles on the drawing (any color) — numbered circles with leader lines pointing to parts/BOM items are symbols only, NOT dimensions.
 2. Extract ONLY black text (dimensions/tolerances/notes) that balloons point to.
 3. Extract GD&T callouts / Feature Control Frames (FCFs) in structured format with symbols and datums.
 4. Only ONE entry per base balloon number (dimension, GD&T, or note).
