@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <title>Inspection Report Software</title>
-  <link rel="stylesheet" href="/assets/style.css?v=28" />
+  <link rel="stylesheet" href="/assets/style.css?v=29" />
 </head>
 <body class="auth-pending">
   <style>
@@ -51,8 +51,9 @@
   <section class="toolbar">
     <label class="file-wrap">
       <span>Upload Engineering drawing</span>
-      <input id="file" type="file" accept=".pdf,image/*" />
+      <input id="file" type="file" accept=".pdf,image/*" multiple />
     </label>
+    <select id="fileSelect" class="file-select" hidden title="Switch between uploaded files"></select>
     <button type="button" id="runBtn" class="primary">Run auto ballooning</button>
     <button type="button" id="downloadExcel" class="btn-secondary" disabled>Download Excel</button>
     <span id="status" class="status"></span>
@@ -149,7 +150,7 @@
 
   <script src="/assets/auth.js?v=4"></script>
   <script src="/assets/inspection_store.js?v=6"></script>
-  <script src="/assets/balloon_parse.js?v=42"></script>
-  <script src="/assets/app.js?v=92"></script>
+  <script src="/assets/balloon_parse.js?v=48"></script>
+  <script src="/assets/app.js?v=95"></script>
 </body>
 </html>

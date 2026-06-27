@@ -151,6 +151,16 @@ input[type="file"] {
   color: #e8eef5;
   max-width: 100%;
 }
+.file-select {
+  margin-right: 0.75rem;
+  padding: 0.5rem 0.65rem;
+  border-radius: 8px;
+  border: 1px solid #2d3a4d;
+  background: #0f1419;
+  color: #e8eef5;
+  font-size: 0.9rem;
+  max-width: 22rem;
+}
 .primary {
   padding: 0.65rem 1.2rem;
   border: none;

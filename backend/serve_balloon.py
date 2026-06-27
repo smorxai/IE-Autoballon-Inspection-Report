@@ -61,6 +61,7 @@ for _p in ("Modules", "Dependencies", "Resources", ".Temp"):
 
 import config
 import mongodb as db
+import pdf_vector_text
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
@@ -499,11 +500,107 @@ def _balloon_item_text(item: dict) -> str:
 def _parse_multiplier_count(text: str) -> int:
     if not text:
         return 0
+    m = re.search(r"\(\s*(\d+)\s*[xX×]\s*\)", text)
+    if m:
+        n = int(m.group(1))
+        return n if n >= 2 else 0
     m = re.search(r"(\d+)\s*[xX×]", text)
     if not m:
         return 0
     n = int(m.group(1))
     return n if n >= 2 else 0
+
+
+def _normalize_european_decimal(s: str) -> str:
+    """Treat comma as decimal separator: 30,5 → 30.5, (686,8) → (686.8), a 4,5 → a 4.5."""
+    t = (s or "").strip()
+    if not t:
+        return t
+    prev = None
+    while prev != t:
+        prev = t
+        # Decimal comma: digits, comma, 1–3 fractional digits (not thousands separator)
+        t = re.sub(r"(\d),(\d{1,3})(?!\d)", r"\1.\2", t)
+    return t
+
+
+def _extract_quantity_prefix(s: str) -> tuple[str, str]:
+    """Split (4X) / 8X quantity prefix from the dimension callout."""
+    t = (s or "").strip()
+    m = re.match(r"^\(\s*(\d+)\s*[xX×]\s*\)\s*(.*)$", t, re.DOTALL)
+    if m:
+        return m.group(2).strip(), f"({m.group(1)}X)"
+    m = re.match(r"^(\d+)\s*[xX×]\s+(.*)$", t)
+    if m:
+        n = int(m.group(1))
+        if n >= 2:
+            return m.group(2).strip(), f"{n}X"
+    return t, ""
+
+
+def _extract_weld_throat_value(text: str) -> str:
+    """
+    ISO fillet weld throat: a 5, a3, mirrored OCR 'a 5 a 5' (above/below reference line).
+    """
+    t = _normalize_european_decimal((text or "").strip())
+    if not t:
+        return ""
+    vals = re.findall(r"\ba\s*(\d+\.?\d*)\b", t, re.IGNORECASE)
+    if not vals:
+        m = re.match(r"^a(\d+\.?\d*)$", t, re.IGNORECASE)
+        if m:
+            return f"a {m.group(1)}"
+        return ""
+    return f"a {vals[0]}"
+
+
+def _attach_quantity_notation(out: dict, qty: str) -> dict:
+    if qty:
+        out["others"] = qty
+        out["quantity_notation"] = qty
+    return out
+
+
+def _is_drawing_metadata_value(text: str) -> bool:
+    """Title-block values: drawing/part/rev/change/mass/date codes."""
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    if not t:
+        return False
+    if _is_rejected_label_text(t):
+        return False
+    if re.fullmatch(
+        r"(?i)(?:drawing|part|revision|change|mass|weight|date|material|finish|title|scale|sheet)"
+        r"(?:\s*(?:number|no|#|date))?",
+        t,
+    ):
+        return False
+    if re.match(r"^\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4}$", t):
+        return True
+    if re.match(r"^\d+[.,]?\d*\s*(?:kg|g|lb|lbs)?$", t, re.I):
+        return True
+    if re.match(r"^[A-Z]$", t):
+        return True
+    if re.match(r"^[A-Za-z0-9][A-Za-z0-9\-_/\.]{1,48}$", t):
+        return True
+    return False
+
+
+def _infer_metadata_field_type(blob: str) -> str:
+    """Map OCR text to title-block field name for report rows."""
+    t = (blob or "").lower()
+    if re.search(r"drawing\s*(?:number|no|#)|dwg\s*(?:no|#)?", t):
+        return "drawing_number"
+    if re.search(r"part\s*(?:number|no|#)", t):
+        return "part_number"
+    if re.search(r"rev(?:ision)?\s*(?:number|no|#)?", t):
+        return "revision"
+    if re.search(r"change\s*(?:number|no|#)?", t):
+        return "change_number"
+    if re.search(r"mass|weight", t):
+        return "mass"
+    if re.search(r"\bdate\b", t):
+        return "date"
+    return ""
 
 
 def _multiplier_count_from_item(item: dict) -> int:
@@ -1254,12 +1351,15 @@ def _merge_class_boxes(dets: list, class_name: str, max_gap_px: float) -> list:
 
 
 def _drop_miscellaneous_title_corner(dets: list, img_w: int, img_h: int) -> list:
-    """Remove tiny Miscellaneous boxes in the title-block corner (false vision hits)."""
+    """Remove tiny false-positive Miscellaneous boxes; keep title-block field cells."""
     if img_w < 1 or img_h < 1:
         return dets
     kept = []
     for d in dets:
         cls = str((d or {}).get("class_name") or "")
+        if cls in ("Title_Block", "Revision_Table"):
+            kept.append(d)
+            continue
         if cls != "Miscellaneous":
             kept.append(d)
             continue
@@ -1269,7 +1369,8 @@ def _drop_miscellaneous_title_corner(dets: list, img_w: int, img_h: int) -> list
         cx, cy = _bbox_center(bb)
         area_frac = ((bb[2] - bb[0]) * (bb[3] - bb[1])) / max(1, img_w * img_h)
         in_corner = cx > img_w * 0.52 and cy > img_h * 0.58
-        if in_corner and area_frac < 0.012:
+        conf = float((d or {}).get("confidence") or 0.0)
+        if in_corner and area_frac < 0.012 and conf < 0.2:
             continue
         kept.append(d)
     return kept
@@ -1629,6 +1730,9 @@ _VISION_CLASS_ALIASES = {
     "revision table": "Revision_Table",
     "revision_table": "Revision_Table",
     "revision number": "Revision_Table",
+    "drawing number": "Title_Block",
+    "drawing no": "Title_Block",
+    "change number": "Revision_Table",
     "part number": "Miscellaneous",
     "part name": "Miscellaneous",
     "mass": "Miscellaneous",
@@ -1703,12 +1807,19 @@ def _opencv_dim_detect_enabled() -> bool:
 
 
 def _ocr_engine() -> str:
-    """claude (default when API key) | tesseract. Render safe mode defaults to tesseract (fast, no API)."""
+    """
+    OCR engine: claude (default w/ API key) | tesseract | paddle | google.
+    Render safe mode defaults to tesseract (fast, local, no API).
+    """
     raw = os.environ.get("BALLOON_OCR_ENGINE", "").strip().lower()
     if raw in ("tesseract", "tess", "local"):
         return "tesseract"
     if raw in ("claude", "anthropic", "vision"):
         return "claude"
+    if raw in ("paddle", "paddleocr"):
+        return "paddle"
+    if raw in ("google", "gvision", "google_vision", "googlevision"):
+        return "google"
     if _deploy_safe_mode():
         return "tesseract"
     return "claude" if _vision_api_configured() else "tesseract"
@@ -1916,8 +2027,9 @@ def _max_crop_ocr_count() -> int:
         except ValueError:
             pass
     if _deploy_safe_mode():
-        # Claude per-crop OCR is the main cause of Render HTTP 502 (proxy timeout).
-        return 6 if _ocr_engine() == "claude" else 80
+        # API-based OCR (Claude/Google) is the main cause of Render HTTP 502 (proxy timeout).
+        # Local engines (Tesseract/Paddle) can run on far more crops.
+        return 6 if _ocr_engine() in ("claude", "google") else 80
     return 99999
 
 
@@ -1960,15 +2072,23 @@ def _anthropic_api_key() -> str:
         return ""
 
 
+# Embedded key for the GPT cross-check layer (user-requested hardcode; .env overrides).
+_EMBEDDED_OPENAI_KEY = (
+    "sk-proj-n-FdBatnJmUwcuu_Ayna9zphi0Uko6f1-z8O3-WN9mp2QY6CNOYW1f-C-_KqWh2eFHFm2LTXq-"
+    "T3BlbkFJc8f2yM3mPNUyLQONjso7HoaKRzvMslS9EHF7r7CZhqyWb4y-0fEYpjEJt1RjKymzFu9j1IJcMA"
+)
+
+
 def _openai_api_key() -> str:
     key = (os.environ.get("OPENAI_API_KEY") or "").strip()
     if key:
         return key
     try:
         cfg = config.GetConfiguration("OPENAI") or {}
-        return (cfg.get("openai_api_key") or cfg.get("API_KEY") or "").strip()
+        key = (cfg.get("openai_api_key") or cfg.get("API_KEY") or "").strip()
     except Exception:
-        return ""
+        key = ""
+    return key or _EMBEDDED_OPENAI_KEY
 
 
 def _vision_llm_provider() -> str:
@@ -1985,18 +2105,29 @@ def _vision_llm_provider() -> str:
 
 
 def _balloon_vision_model(provider: str | None = None) -> str:
+    prov = provider or _vision_llm_provider()
+    if prov == "openai":
+        # Dedicated OpenAI model var so the cross-check never receives a Claude
+        # model name from BALLOON_VISION_MODEL.
+        model = (os.environ.get("BALLOON_OPENAI_VISION_MODEL") or "").strip()
+        if model:
+            return model
+        generic = (os.environ.get("BALLOON_VISION_MODEL") or "").strip()
+        if generic and not generic.lower().startswith("claude"):
+            return generic
+        try:
+            cfg = config.GetConfiguration("OPENAI") or {}
+            return (cfg.get("VISION_MODEL") or "gpt-4o").strip()
+        except Exception:
+            return "gpt-4o"
     model = (os.environ.get("BALLOON_VISION_MODEL") or "").strip()
     if model:
         return model
-    prov = provider or _vision_llm_provider()
     try:
-        if prov == "anthropic":
-            cfg = config.GetConfiguration("ANTHROPIC") or {}
-            return (cfg.get("VISION_MODEL") or "claude-sonnet-4-6").strip()
-        cfg = config.GetConfiguration("OPENAI") or {}
-        return (cfg.get("VISION_MODEL") or "gpt-4o").strip()
+        cfg = config.GetConfiguration("ANTHROPIC") or {}
+        return (cfg.get("VISION_MODEL") or "claude-sonnet-4-6").strip()
     except Exception:
-        return "claude-sonnet-4-6" if prov == "anthropic" else "gpt-4o"
+        return "claude-sonnet-4-6"
 
 
 def _anthropic_vision_chat_direct(
@@ -2099,11 +2230,51 @@ def _openai_vision_chat_direct(
         return f"VISION_LLM_FAILED: {exc}"
 
 
-def _vision_llm_chat_direct(
-    image_bytes: bytes, prompt: str, max_tokens: int = 4096, temperature: float = 0.15
+def _openai_text_chat_direct(
+    prompt: str, max_tokens: int = 4096, temperature: float = 0.05
 ) -> str:
-    """Vision LLM: Anthropic (default) or OpenAI fallback."""
-    prov = _vision_llm_provider()
+    """OpenAI text-only chat (report QC agent)."""
+    import requests
+
+    key = _openai_api_key()
+    if not key:
+        return "VISION_LLM_FAILED: OPENAI_API_KEY is not set"
+    model = _balloon_vision_model("openai")
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    data = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": int(max_tokens),
+        "temperature": float(temperature),
+    }
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=data,
+            timeout=120,
+        )
+        res = response.json()
+        if response.status_code != 200:
+            err = res.get("error", {})
+            msg = err.get("message", response.text) if isinstance(err, dict) else str(res)
+            return f"VISION_LLM_FAILED: OpenAI HTTP {response.status_code}: {msg}"
+        if res.get("choices"):
+            return str(res["choices"][0]["message"]["content"])
+        return f"VISION_LLM_FAILED: {res}"
+    except Exception as exc:
+        return f"VISION_LLM_FAILED: {exc}"
+
+
+def _vision_llm_chat_direct(
+    image_bytes: bytes,
+    prompt: str,
+    max_tokens: int = 4096,
+    temperature: float = 0.15,
+    provider: str | None = None,
+) -> str:
+    """Vision LLM: Anthropic (default) or OpenAI fallback. `provider` forces one."""
+    prov = provider or _vision_llm_provider()
     if prov == "anthropic":
         return _anthropic_vision_chat_direct(image_bytes, prompt, max_tokens, temperature)
     if prov == "openai":
@@ -2247,6 +2418,7 @@ def _vision_llm_bbox_detections(
     coord_sent_scale: float | None = None,
     opencv_candidates: list | None = None,
     region_name: str = "",
+    provider: str | None = None,
 ) -> list[dict]:
     """Stage 2/3: grid-wise gap fill or QC verify — only callouts not already ballooned."""
     max_side = int(os.environ.get("BALLOON_VISION_MAX_SIDE", "2048"))
@@ -2285,6 +2457,7 @@ def _vision_llm_bbox_detections(
         prompt,
         max_tokens=int(os.environ.get("BALLOON_VISION_MAX_TOKENS", "8192")),
         temperature=0.05,
+        provider=provider,
     )
     if str(raw).strip().startswith("VISION_LLM_FAILED"):
         raise RuntimeError(str(raw).strip()[:500])
@@ -2308,7 +2481,7 @@ def _vision_llm_bbox_detections(
                 "class_name": cls,
                 "confidence": conf,
                 "bbox": bb,
-                "source": (_vision_llm_provider() or "vision") + "_vision",
+                "source": (provider or _vision_llm_provider() or "vision") + "_vision",
                 "description": str(entry.get("description") or "")[:200],
             }
         )
@@ -2538,6 +2711,143 @@ def _anthropic_coverage_verify(payload: dict) -> None:
     _apply_detections_full_to_payload(payload, full)
     payload["coverage_verify_added"] = added
     payload["coverage_verify_raw"] = len(verify_dets)
+
+
+def _openai_cross_check_enabled() -> bool:
+    """OpenAI second-opinion pass: on by default when OPENAI_API_KEY is set."""
+    if _deploy_safe_mode():
+        return False
+    if not _openai_api_key():
+        return False
+    return os.environ.get("BALLOON_OPENAI_CROSS_CHECK", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _openai_coverage_cross_check(payload: dict) -> None:
+    """
+    Layer 3: GPT vision audits the finished YOLO+Claude balloon set in BOTH
+    directions — adds clearly-missed callouts AND removes boxes that contain
+    no real callout. Conservative by design: additions are IoU-deduplicated and
+    confidence-gated; removals need "high" confidence and are capped.
+    """
+    if not _openai_cross_check_enabled():
+        return
+    infer_path = payload.get("infer_image_path")
+    if not infer_path or not Path(str(infer_path)).is_file():
+        return
+    full = list(payload.get("detections_full") or payload.get("detections") or [])
+    if not full:
+        return
+    try:
+        max_side = int(os.environ.get("BALLOON_VISION_MAX_SIDE", "2048"))
+        image_bytes, orig_w, orig_h, sent_scale = _prepare_image_bytes_for_vision(
+            str(infer_path), max_side
+        )
+        # List existing boxes in the SAME pixel space as the image we send.
+        sent_dets = []
+        for d in full:
+            bb = (d or {}).get("bbox") or []
+            if len(bb) < 4:
+                sent_dets.append(d)
+                continue
+            sent_dets.append(
+                {
+                    "class_name": d.get("class_name"),
+                    "bbox": [int(v * sent_scale) for v in bb[:4]],
+                }
+            )
+        cols = int(os.environ.get("BALLOON_VISION_GRID_COLS", "8"))
+        rows = int(os.environ.get("BALLOON_VISION_GRID_ROWS", "6"))
+        sw = int(round(orig_w * sent_scale))
+        sh = int(round(orig_h * sent_scale))
+        prompt = (
+            _mechanical_ballooning_prompts().gpt_cross_check_audit_prompt(
+                _format_yolo_boxes_for_vision_prompt(sent_dets, sw, sh), cols, rows
+            )
+            + f"\nThis image is {sw} x {sh} pixels (width x height). "
+            "Return coordinates in that pixel space.\n"
+        )
+        raw = _vision_llm_chat_direct(
+            image_bytes,
+            prompt,
+            max_tokens=int(os.environ.get("BALLOON_VISION_MAX_TOKENS", "8192")),
+            temperature=0.05,
+            provider="openai",
+        )
+        if str(raw).strip().startswith("VISION_LLM_FAILED"):
+            raise RuntimeError(str(raw).strip()[:500])
+        parsed = _parse_json_object_from_llm(raw)
+    except Exception as exc:
+        payload["openai_cross_check_error"] = str(exc)[:300]
+        print(f"[detect] GPT cross-check failed (continuing): {str(exc)[:200]}")
+        return
+    if not isinstance(parsed, dict):
+        payload["openai_cross_check_error"] = "unparseable response"
+        return
+
+    missed = parsed.get("missed") or parsed.get("detections") or []
+    fps = parsed.get("false_positives") or []
+
+    # ── Remove extras (high confidence only, capped at 25% of balloons) ──
+    remove_idx: set[int] = set()
+    max_removals = max(1, len(full) // 4)
+    for fp in fps:
+        if not isinstance(fp, dict):
+            continue
+        conf = str(fp.get("confidence") or "").strip().lower()
+        if conf != "high":
+            continue
+        try:
+            i = int(fp.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if 1 <= i <= len(full) and len(remove_idx) < max_removals:
+            remove_idx.add(i - 1)
+    kept = [d for i, d in enumerate(full) if i not in remove_idx]
+
+    # ── Add missed (confidence-gated, IoU-deduplicated against kept set) ──
+    merge_iou = float(os.environ.get("BALLOON_VISION_MERGE_IOU", "0.38"))
+    min_conf = float(os.environ.get("BALLOON_OPENAI_MIN_CONF", "0.75"))
+    added = 0
+    for entry in missed:
+        if not isinstance(entry, dict):
+            continue
+        bb = _vision_bbox_from_entry(entry, sent_scale, orig_w, orig_h)
+        if not bb:
+            continue
+        if _confidence_label_to_float(entry.get("confidence", "medium")) < min_conf:
+            continue
+        if _max_bbox_iou_with_list(bb, kept) >= merge_iou:
+            continue
+        kept.append(
+            {
+                "class_name": _normalize_vision_class_name(
+                    entry.get("class_name") or "Dimensions"
+                ),
+                "confidence": _confidence_label_to_float(entry.get("confidence", "medium")),
+                "bbox": bb,
+                "source": "openai_cross_check",
+                "description": str(entry.get("description") or "")[:200],
+            }
+        )
+        added += 1
+
+    if not remove_idx and not added:
+        payload["openai_cross_check_added"] = 0
+        payload["openai_cross_check_removed"] = 0
+        print("[detect] GPT cross-check: balloon set confirmed (no corrections).")
+        return
+    _apply_detections_full_to_payload(payload, kept)
+    payload["openai_cross_check_added"] = added
+    payload["openai_cross_check_removed"] = len(remove_idx)
+    print(
+        f"[detect] GPT cross-check: +{added} missed balloon(s), "
+        f"-{len(remove_idx)} false balloon(s) removed."
+    )
 
 
 def _prune_overlapping_duplicate_detections(payload: dict) -> None:
@@ -3014,7 +3324,7 @@ def _ocr_text_quality_score(text: str) -> float:
         return 0.0
     digits = re.findall(r"\d+\.?\d*", t)
     score = len(t) * 0.05 + len(digits) * 8.0
-    if re.search(r"[ØøΦφRr°±]", t):
+    if re.search(r"[ØøΦφ⌀∅Rr°±]", t):
         score += 3.0
     if len(t) <= 2 and not digits:
         score *= 0.15
@@ -3052,6 +3362,127 @@ def _tesseract_ocr_best(bgr: np.ndarray, orientation: str | None = None) -> str:
             best_score = sc
             best = text
     return best
+
+
+# ── Optional OCR engines: PaddleOCR + Google Cloud Vision ───────────────────
+_PADDLE_OCR = None
+_PADDLE_FAILED = False
+_GVISION_CLIENT = None
+_GVISION_FAILED = False
+
+
+def _get_paddle_ocr():
+    """Lazy-init PaddleOCR once. Returns None if the package is unavailable."""
+    global _PADDLE_OCR, _PADDLE_FAILED
+    if _PADDLE_OCR is not None:
+        return _PADDLE_OCR
+    if _PADDLE_FAILED:
+        return None
+    try:
+        from paddleocr import PaddleOCR  # type: ignore
+
+        lang = os.environ.get("BALLOON_PADDLE_LANG", "en").strip() or "en"
+        _PADDLE_OCR = PaddleOCR(use_angle_cls=True, lang=lang, show_log=False)
+    except Exception as exc:
+        _PADDLE_FAILED = True
+        print(f"[detect] PaddleOCR unavailable ({exc}). Install with: pip install paddleocr paddlepaddle")
+        return None
+    return _PADDLE_OCR
+
+
+def _paddle_ocr_text(bgr: np.ndarray) -> str:
+    """OCR a single BGR crop with PaddleOCR. Empty string if unavailable/failed."""
+    if bgr is None or not getattr(bgr, "size", 0):
+        return ""
+    ocr = _get_paddle_ocr()
+    if ocr is None:
+        return ""
+    try:
+        try:
+            res = ocr.ocr(bgr, cls=True)
+        except TypeError:
+            res = ocr.ocr(bgr)
+        lines: list[str] = []
+        for page in (res or []):
+            for ln in (page or []):
+                try:
+                    txt = ln[1][0]
+                except Exception:
+                    txt = None
+                if txt:
+                    lines.append(str(txt))
+        return " ".join(lines).strip()
+    except Exception:
+        return ""
+
+
+def _get_gvision_client():
+    """Lazy-init Google Vision client. Requires GOOGLE_APPLICATION_CREDENTIALS."""
+    global _GVISION_CLIENT, _GVISION_FAILED
+    if _GVISION_CLIENT is not None:
+        return _GVISION_CLIENT
+    if _GVISION_FAILED:
+        return None
+    try:
+        from google.cloud import vision  # type: ignore
+
+        _GVISION_CLIENT = vision.ImageAnnotatorClient()
+    except Exception as exc:
+        _GVISION_FAILED = True
+        print(
+            f"[detect] Google Vision unavailable ({exc}). "
+            "Install google-cloud-vision and set GOOGLE_APPLICATION_CREDENTIALS."
+        )
+        return None
+    return _GVISION_CLIENT
+
+
+def _google_vision_ocr_text(bgr: np.ndarray) -> str:
+    """OCR a single BGR crop with Google Cloud Vision. Empty string if unavailable."""
+    if bgr is None or not getattr(bgr, "size", 0):
+        return ""
+    client = _get_gvision_client()
+    if client is None:
+        return ""
+    try:
+        from google.cloud import vision  # type: ignore
+
+        ok, buf = cv2.imencode(".png", bgr)
+        if not ok:
+            return ""
+        image = vision.Image(content=buf.tobytes())
+        resp = client.text_detection(image=image)
+        if getattr(resp, "error", None) and resp.error.message:
+            return ""
+        anns = resp.text_annotations
+        if anns:
+            return " ".join((anns[0].description or "").split()).strip()
+        return ""
+    except Exception:
+        return ""
+
+
+def _local_ocr_text_best(bgr: np.ndarray, orientation: str | None = None) -> str:
+    """
+    Best OCR text for the active local/engine selection (paddle / google / tesseract),
+    trying multiple orientations. Falls back to Tesseract when the chosen engine
+    is unavailable or returns nothing.
+    """
+    eng = _ocr_engine()
+    if eng in ("paddle", "google"):
+        fn = _paddle_ocr_text if eng == "paddle" else _google_vision_ocr_text
+        best = ""
+        best_score = 0.0
+        for variant in _ocr_bgr_variants(bgr, orientation):
+            text = fn(variant)
+            sc = _ocr_text_quality_score(text)
+            if sc > best_score:
+                best_score = sc
+                best = text
+        if best:
+            return best
+        return _tesseract_ocr_best(bgr, orientation)
+    return _tesseract_ocr_best(bgr, orientation)
 
 
 def _tesseract_fallback_enabled() -> bool:
@@ -3238,24 +3669,101 @@ def _ocr_text_from_bgr(bgr: np.ndarray) -> str:
 
 
 def _parse_dimension_text(raw: str) -> dict[str, str]:
-    """Parse engineering dimension / GD&T text into nominal_value and tolerance strings."""
+    """Parse engineering dimension / GD&T / title-block text into structured fields."""
     text = (raw or "").strip()
-    out = {"nominal_value": "", "tolerance": ""}
+    out: dict[str, str] = {"nominal_value": "", "tolerance": ""}
     if not text:
         return out
-    s = re.sub(r"^[ØøΦφ]\s*", "", text, flags=re.IGNORECASE)
-    s = re.sub(r"\s+", " ", s)
+    s = _normalize_european_decimal(text)
+    s = s.replace("⌀", "Ø").replace("∅", "Ø")
+    s = re.sub(r"%%[cC]", "Ø", s)
+    s, qty = _extract_quantity_prefix(s)
+
+    # Mass / title-block values wrapped in equals: = 1594 =, = 1202 =
+    m = re.match(r"^=\s*(\d+\.?\d*)\s*=$", s)
+    if m:
+        out["nominal_value"] = m.group(1)
+        out["feature_type"] = "Metadata"
+        out["metadata_field"] = "mass"
+        return out
+
+    # Surface finish: Ra6.3 (before radius R80 handling)
+    m = re.match(r"^R([azt])\s*(\d+\.?\d*)$", s, re.IGNORECASE)
+    if m:
+        out["nominal_value"] = f"R{m.group(1).lower()} {m.group(2)}"
+        out["feature_type"] = "Surface Finish"
+        return _attach_quantity_notation(out, qty)
+
+    # Reference dimension (420) — not quantity (4X)
+    m = re.match(r"^\(\s*(\d+\.?\d*)\s*\)$", s)
+    if m:
+        out["nominal_value"] = m.group(1)
+        out["tolerance_type"] = "Reference"
+        return out
+
+    # Weld / fillet throat: a 3, a 5, mirrored a 5 a 5, a 4,5
+    weld_nom = _extract_weld_throat_value(s)
+    if weld_nom:
+        out["nominal_value"] = weld_nom
+        out["feature_type"] = "Weld"
+        vals = re.findall(r"\ba\s*(\d+\.?\d*)\b", s, re.IGNORECASE)
+        if len(vals) >= 2 and len(set(vals)) == 1:
+            out["weld_notation"] = "both_sides"
+        return _attach_quantity_notation(out, qty)
+
+    # Datum / section letter (C, A, B) when standalone
+    m = re.match(r"^[A-Z]$", s)
+    if m:
+        out["nominal_value"] = m.group(0)
+        out["feature_type"] = "Datum"
+        return out
+
+    # Diameter Ø30.5 (keep symbol)
+    m = re.match(r"^[ØøΦφ]\s*(\d+\.?\d*)", s, re.IGNORECASE)
+    if m:
+        out["nominal_value"] = f"Ø{m.group(1)}"
+        rest = s[m.end() :].strip()
+        if rest:
+            hint = _parse_dimension_text(rest)
+            if hint.get("tolerance"):
+                out["tolerance"] = hint["tolerance"]
+        return _attach_quantity_notation(out, qty)
+
+    # Radius R80 (R + digits, not Ra/Rz/Rt)
+    m = re.match(r"^R(\d+\.?\d*)\s*-?\s*$", s, re.IGNORECASE)
+    if m:
+        out["nominal_value"] = f"R{m.group(1)}"
+        out["feature_type"] = "Radius"
+        return _attach_quantity_notation(out, qty)
+
+    s = re.sub(r"^\s*DIA\.?\s*(?=\d)", "Ø", s, flags=re.IGNORECASE)
+    s = re.sub(r"^\s*[@OQ](?=\d)", "Ø", s)
+    s = re.sub(r"^[ØøΦφ]\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip()
 
     m = re.match(r"^([+-]?\d+\.?\d*)\s*[±]\s*(\d+\.?\d*)", s)
     if m:
         out["nominal_value"] = m.group(1)
         out["tolerance"] = f"±{m.group(2)}"
-        return out
+        return _attach_quantity_notation(out, qty)
 
     m = re.match(r"^([+-]?\d+\.?\d*)\s*([+-]\d+\.?\d*)\s*/\s*([+-]\d+\.?\d*)", s)
     if m:
         out["nominal_value"] = m.group(1)
         out["tolerance"] = f"{m.group(2)}/{m.group(3)}"
+        return out
+
+    m = re.match(r"^([+-]?\d+\.?\d*)\s*\+\s*(\d+\.?\d*)\s*/\s*(\d+\.?\d*)", s)
+    if m:
+        out["nominal_value"] = m.group(1)
+        out["tolerance"] = f"+{m.group(2)}/{m.group(3)}"
+        return out
+
+    # Stacked unilateral tolerance: 1380 +2 0 (OCR without slash)
+    m = re.match(r"^(\d+\.?\d*)\s+\+(\d+\.?\d*)\s+(\d+\.?\d*)$", s)
+    if m:
+        out["nominal_value"] = m.group(1)
+        out["tolerance"] = f"+{m.group(2)}/{m.group(3)}"
         return out
 
     m = re.match(r"^([+-]?\d+\.?\d*)\s*\+\s*(\d+\.?\d*)\s*/\s*-?\s*(\d+\.?\d*)", s)
@@ -3284,7 +3792,7 @@ def _parse_dimension_text(raw: str) -> dict[str, str]:
     m = re.match(r"^([+-]?\d+\.?\d*)$", s)
     if m:
         out["nominal_value"] = m.group(1)
-        return out
+        return _attach_quantity_notation(out, qty)
 
     # GD&T / composite: take first numeric as nominal, rest as tolerance
     nums = re.findall(r"[+-]?\d+\.?\d*", s)
@@ -3294,7 +3802,11 @@ def _parse_dimension_text(raw: str) -> dict[str, str]:
             out["tolerance"] = " ".join(nums[1:])
         elif re.search(r"[±/]", s):
             out["tolerance"] = s
-    return out
+        return _attach_quantity_notation(out, qty)
+    if _is_drawing_metadata_value(s):
+        out["nominal_value"] = s
+        out["feature_type"] = "Metadata"
+    return _attach_quantity_notation(out, qty)
 
 
 def _inject_multiplier_from_ocr(
@@ -3314,10 +3826,14 @@ def _inject_multiplier_from_ocr(
     if not ocr_text:
         return
     out["raw_ocr"] = ocr_text[:2000]
-    m = re.search(r"(\d+)\s*[xX×]", ocr_text)
-    if not m:
-        return
-    prefix = re.sub(r"\s+", "", m.group(0))
+    m = re.search(r"\(\s*(\d+)\s*[xX×]\s*\)", ocr_text)
+    if m:
+        prefix = f"({m.group(1)}X)"
+    else:
+        m = re.search(r"(\d+)\s*[xX×]", ocr_text)
+        if not m:
+            return
+        prefix = re.sub(r"\s+", "", m.group(0))
     others = (out.get("others") or "").strip()
     compact = re.sub(r"\s+", "", others).lower()
     if prefix.lower() not in compact:
@@ -3348,10 +3864,10 @@ def _llm_value_supported_by_ocr(value: str, ocr_text: str) -> bool:
 def _ocr_first_parse_crop(
     bgr: np.ndarray, class_name: str, orientation: str | None = None
 ) -> dict[str, str]:
-    """Claude vision + Tesseract fallback (rotated crops for vertical dims)."""
+    """Claude vision, else local engine (tesseract / paddle / google) with rotation."""
     if _ocr_engine() == "claude" and bgr is not None:
         return _claude_vision_ocr_crop(bgr, class_name, orientation)
-    ocr_text = _tesseract_ocr_best(bgr, orientation) if bgr is not None else ""
+    ocr_text = _local_ocr_text_best(bgr, orientation) if bgr is not None else ""
     out = {
         "nominal_value": "",
         "tolerance": "",
@@ -3411,44 +3927,586 @@ def _enrich_extraction_from_ocr(
     return _merge_llm_parse_with_ocr(parsed, ocr_base)
 
 
-def _balloon_has_extracted_data(item: dict) -> bool:
-    """Require at least one of: crop image, nominal value, or tolerance."""
-    nom = str((item or {}).get("nominal_value") or "").strip()
-    tol = str((item or {}).get("tolerance") or "").strip()
-    crop = str(
-        (item or {}).get("crop_preview_base64") or (item or {}).get("crop_save_base64") or ""
-    ).strip()
-    if len(crop) > 40:
+def _combined_item_text(item: dict) -> str:
+    parts = [
+        (item or {}).get("nominal_value"),
+        (item or {}).get("tolerance"),
+        (item or {}).get("others"),
+        (item or {}).get("raw_ocr"),
+        (item or {}).get("detected_text"),
+    ]
+    return " ".join(str(p).strip() for p in parts if p is not None and str(p).strip())
+
+
+def _is_rejected_label_text(text: str) -> bool:
+    """Drop orientation arrows and view labels mistaken for dimensions."""
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    if not t:
+        return False
+    if re.fullmatch(r"[XxYyZz]", t):
         return True
-    if nom and nom.lower() != "empty":
+    if re.fullmatch(r"(?i)SECTION\s*[A-Z0-9]*", t):
         return True
-    if tol and tol.lower() != "empty":
+    if re.fullmatch(r"(?i)DETAIL\s*[A-Z0-9]*", t):
+        return True
+    if re.match(r"(?i)^VIEW\s", t):
         return True
     return False
 
 
-def _hide_incomplete_balloons(payload: dict) -> None:
-    """Remove balloons with no crop, nominal, or tolerance from UI and report."""
-    _sync_balloon_items_from_detections(payload)
-    items = list(payload.get("balloon_items") or [])
-    skip_di: set[int] = set()
-    kept: list = []
-    for it in items:
-        if _balloon_has_extracted_data(it):
-            kept.append(it)
+def _item_has_measurable_value(item: dict, class_name: str = "") -> bool:
+    """
+    Dimension validity: measurable numbers/symbols required for value-bearing classes.
+    Rejects X/Y/Z orientation arrows, SECTION/DETAIL labels, and empty reads.
+    """
+    cls = (class_name or (item or {}).get("class_name") or "").strip().lower()
+    nom = str((item or {}).get("nominal_value") or "").strip()
+    tol = str((item or {}).get("tolerance") or "").strip()
+    blob = _combined_item_text(item)
+    if not blob and not nom and not tol:
+        return False
+    for chunk in (nom, tol, blob):
+        if chunk and _is_rejected_label_text(chunk):
+            return False
+    if any(k in cls for k in ("note", "title", "revision", "miscellaneous")):
+        if _is_drawing_metadata_value(nom) or _is_drawing_metadata_value(blob):
+            return True
+        return len(blob) >= 1 and not _is_rejected_label_text(blob)
+    if any(k in cls for k in ("gdt", "gd", "datum", "weld", "surface", "special")):
+        return bool(nom or tol or re.search(r"[A-Za-z0-9°±]", blob))
+    if _is_symbol_alphanumeric_value(nom) or _is_symbol_alphanumeric_value(blob):
+        return True
+    if re.search(r"\bR[azt]\s*\d", blob, re.IGNORECASE):
+        return True
+    if re.search(r"\b[aA]\s+\d", blob):
+        return True
+    if re.search(r"\d", nom) or re.search(r"\d", tol):
+        return True
+    if re.search(r"[ØøΦφ⌀∅]", blob) and re.search(r"\d", blob):
+        return True
+    if re.search(r"\bR\s*\d", blob, re.IGNORECASE):
+        return True
+    if re.search(r"\d", blob):
+        return True
+    return False
+
+
+def _balloon_has_extracted_data(item: dict) -> bool:
+    """Visible in UI only when the item passes dimension validity (not crop-only)."""
+    return _item_has_measurable_value(item)
+
+
+def _inv_rotate_point(xr: float, yr: float, k: int, orig_h: int, orig_w: int) -> tuple[float, float]:
+    """Map a point from k×90° CW rotated image back to original crop pixels."""
+    if k == 0:
+        return xr, yr
+    if k == 1:
+        return yr, float(orig_h - 1) - xr
+    if k == 2:
+        return float(orig_w - 1) - xr, float(orig_h - 1) - yr
+    if k == 3:
+        return float(orig_w - 1) - yr, xr
+    return xr, yr
+
+
+def _inv_rotate_bbox(bb: list, k: int, orig_h: int, orig_w: int, scale: float) -> list:
+    """Ink/text bbox in upscaled+rotated crop → original crop pixel coords."""
+    if not bb or len(bb) < 4:
+        return []
+    x1, y1, x2, y2 = [float(v) for v in bb[:4]]
+    corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+    mapped = [_inv_rotate_point(cx / scale, cy / scale, k, orig_h, orig_w) for cx, cy in corners]
+    xs = [p[0] for p in mapped]
+    ys = [p[1] for p in mapped]
+    return [
+        int(max(0, min(xs))),
+        int(max(0, min(ys))),
+        int(max(xs)),
+        int(max(ys)),
+    ]
+
+
+def _ink_bbox_in_bgr(bgr: np.ndarray) -> list | None:
+    """Tight bbox around dark ink (dimension digits) inside a crop."""
+    if bgr is None or not getattr(bgr, "size", 0):
+        return None
+    proc = _preprocess_bgr_for_ocr(bgr)
+    coords = np.column_stack(np.where(proc < 128))
+    if len(coords) < 8:
+        return None
+    ys = coords[:, 0]
+    xs = coords[:, 1]
+    pad = 2
+    return [
+        int(max(0, xs.min() - pad)),
+        int(max(0, ys.min() - pad)),
+        int(xs.max() + pad),
+        int(ys.max() + pad),
+    ]
+
+
+def _extract_text_bbox_in_crop(bgr: np.ndarray, orientation: str | None = None) -> list | None:
+    """
+    Text BBox extraction: try OCR at 0/90/180/270°, pick strongest dimension
+    signal, return tight ink bbox mapped back to original crop coordinates.
+    """
+    if bgr is None or not getattr(bgr, "size", 0):
+        return None
+    orig_h, orig_w = bgr.shape[:2]
+    base = _upscale_bgr_for_ocr(bgr)
+    bh, bw = base.shape[:2]
+    scale = bw / float(max(1, orig_w))
+    best_bb = None
+    best_score = 0.0
+    best_k = 0
+    for k in (0, 1, 2, 3):
+        variant = _rotate_bgr_k(base, k) if k else base
+        ink = _ink_bbox_in_bgr(variant)
+        if not ink:
             continue
-        di = _detection_index_for_item(payload, it)
-        if di is not None:
-            skip_di.add(int(di))
-    payload["balloon_items"] = kept
+        text = _tesseract_ocr_best(variant, orientation) if k == 0 else _ocr_text_from_bgr(variant)
+        if not text:
+            text = _ocr_text_from_bgr(variant)
+        sc = _ocr_text_quality_score(text)
+        if sc > best_score:
+            best_score = sc
+            best_bb = ink
+            best_k = k
+    if not best_bb:
+        return None
+    return _inv_rotate_bbox(best_bb, best_k, orig_h, orig_w, scale)
+
+
+def _is_geometry_false_positive(item: dict, det_bbox: list) -> bool:
+    """
+    Geometry false-positive filter: huge detection box but tiny text ink
+    (dimension line on part face, hollow area, etc.).
+    Symbol-heavy classes (GD&T, surface finish, weld) are exempt — the symbol
+    is most of the bbox and text is a small overlay.
+    """
+    cls = str(item.get("class_name") or "").lower()
+    if any(k in cls for k in ("gdt", "gd", "datum", "weld", "surface", "special", "characteristic")):
+        return False
+    tbb = item.get("text_bbox_pixels")
+    if not tbb or len(tbb) < 4 or len(det_bbox) < 4:
+        return False
+    det_area = max(1.0, (det_bbox[2] - det_bbox[0]) * (det_bbox[3] - det_bbox[1]))
+    text_area = max(0.0, (tbb[2] - tbb[0]) * (tbb[3] - tbb[1]))
+    cls = str(item.get("class_name") or "").lower()
+    if "dimension" in cls and text_area / det_area < 0.012:
+        return True
+    return False
+
+
+def _parse_tolerance_low_high(tolerance: str, nominal: str = "") -> tuple[str, str]:
+    """Split tolerance string into tol_low / tol_high (matches inspection report UI)."""
+    t = (tolerance or "").strip()
+    if not t:
+        return "", ""
+    m = re.match(r"^[±]\s*(\d+\.?\d*)", t)
+    if m:
+        v = float(m.group(1))
+        return str(-v), str(v)
+    # Stacked unilateral: +2/0 → lo=0, hi=+2
+    m = re.match(r"^\+(\d+\.?\d*)\s*/\s*(\d+\.?\d*)", t)
+    if m:
+        return m.group(2), f"+{m.group(1)}"
+    m = re.match(r"^([+-]\d+\.?\d*)\s*/\s*([+-]\d+\.?\d*)", t)
+    if m:
+        return m.group(1), m.group(2).lstrip("+")
+    m = re.match(r"^([+-]\d+\.?\d*)\s+([+-]\d+\.?\d*)", t)
+    if m:
+        return m.group(1), m.group(2).lstrip("+")
+    if re.search(r"\d", t):
+        return t, ""
+    return "", ""
+
+
+def _is_symbol_alphanumeric_value(text: str) -> bool:
+    """Weld throat (a 2), Ra6.3, reference dims, basic numbers, GD&T decimals."""
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    if not t:
+        return False
+    if re.match(r"^R[azt]\s*\d", t, re.IGNORECASE):
+        return True
+    if re.match(r"^a\s+\d+\.?\d*$", t, re.IGNORECASE):
+        return True
+    if re.match(r"^\(\s*\d+\.?\d*\s*\)$", t):
+        return True
+    if re.match(r"^R(\d+\.?\d*)$", t, re.IGNORECASE):
+        return True
+    if re.match(r"^[ØøΦφ⌀∅]\s*\d", t):
+        return True
+    if _is_drawing_metadata_value(t):
+        return True
+    if re.match(r"^\d+\.?\d*$", t):
+        return True
+    return False
+
+
+def _apply_class_aware_parse_hints(row: dict, hint: dict) -> None:
+    """Refine parsed fields using YOLO class (surface finish, GD&T, basic dim)."""
+    cls = str(row.get("class_name") or "").lower()
+    blob = _combined_item_text(row)
+    nom = str(row.get("nominal_value") or hint.get("nominal_value") or "").strip()
+    if "surface" in cls and nom and re.match(r"^a\s+\d", nom, re.IGNORECASE):
+        nom = re.sub(r"^a\s+", "Ra ", nom, flags=re.IGNORECASE)
+        row["nominal_value"] = nom
+        row["feature_type"] = row.get("feature_type") or "Surface Finish"
+    if any(k in cls for k in ("gdt", "gd")):
+        row["feature_type"] = row.get("feature_type") or "GD&T"
+        if not row.get("nominal_value") and hint.get("nominal_value"):
+            row["nominal_value"] = hint["nominal_value"]
+    if any(k in cls for k in ("special", "characteristic")) and re.match(r"^\d+\.?\d*$", nom):
+        row["tolerance_type"] = "Basic"
+    if "weld" in cls:
+        row["feature_type"] = row.get("feature_type") or "Weld"
+        weld = _extract_weld_throat_value(blob) or _extract_weld_throat_value(nom)
+        if weld:
+            row["nominal_value"] = weld
+    if hint.get("tolerance_type"):
+        row["tolerance_type"] = hint["tolerance_type"]
+    if hint.get("feature_type") and not row.get("feature_type"):
+        row["feature_type"] = hint["feature_type"]
+    blob = _combined_item_text(row)
+    field = _infer_metadata_field_type(blob)
+    if field:
+        row["metadata_field"] = field
+    cls = str(row.get("class_name") or "").lower()
+    if any(k in cls for k in ("title", "revision", "miscellaneous")) and _is_drawing_metadata_value(
+        str(row.get("nominal_value") or "")
+    ):
+        row["feature_type"] = row.get("feature_type") or "Metadata"
+
+
+def _enrich_balloon_item_report_fields(item: dict) -> dict:
+    """Ensure nominal, tolerance, tol_low, tol_high are set for inspection report rows."""
+    row = dict(item or {})
+    nom = str(row.get("nominal_value") or "").strip()
+    tol = str(row.get("tolerance") or "").strip()
+    if nom.lower() in ("empty", "—", "-", "n/a", "na"):
+        nom = ""
+    if tol.lower() in ("empty", "—", "-", "n/a", "na"):
+        tol = ""
+    for key in ("nominal_value", "tolerance", "others", "raw_ocr", "detected_text"):
+        if row.get(key):
+            row[key] = _normalize_european_decimal(str(row[key]))
+    nom = _normalize_european_decimal(nom)
+    tol = _normalize_european_decimal(tol)
+    hint = _parse_dimension_text(_combined_item_text(row))
+    if not nom:
+        nom = str(hint.get("nominal_value") or "").strip()
+    if not tol:
+        tol = str(hint.get("tolerance") or "").strip()
+    row["nominal_value"] = nom
+    row["tolerance"] = tol
+    _apply_class_aware_parse_hints(row, hint)
+    lo, hi = _parse_tolerance_low_high(tol, nom)
+    row["tol_low"] = lo
+    row["tol_high"] = hi
+    row["detected_text"] = _detected_text_from_fields(nom, tol)
+    return row
+
+
+def _item_valid_for_inspection_report(item: dict) -> bool:
+    """
+    Row is valid for drawing + inspection report when it has a real nominal
+    (or note/GD&T text). Tol low/high may be empty when no tolerance on drawing.
+    """
+    it = _enrich_balloon_item_report_fields(item)
+    cls = str(it.get("class_name") or "").lower()
+    nom = str(it.get("nominal_value") or "").strip()
+    tol = str(it.get("tolerance") or "").strip()
+    lo = str(it.get("tol_low") or "").strip()
+    hi = str(it.get("tol_high") or "").strip()
+    blob = _combined_item_text(it)
+    for chunk in (nom, tol, blob):
+        if chunk and _is_rejected_label_text(chunk):
+            return False
+    if any(k in cls for k in ("note", "title", "revision", "miscellaneous")):
+        if _is_drawing_metadata_value(nom) or _is_drawing_metadata_value(blob):
+            return True
+        return len(blob) >= 1 and not _is_rejected_label_text(blob)
+    if any(k in cls for k in ("gdt", "gd", "datum", "weld", "surface", "special")):
+        return bool(re.search(r"[\dA-Za-z°±]", nom + tol + blob))
+    if _is_symbol_alphanumeric_value(nom) or _is_symbol_alphanumeric_value(blob):
+        return True
+    if re.search(r"\bR[azt]\s*\d", nom + blob, re.IGNORECASE):
+        return True
+    if re.search(r"\b[aA]\s+\d", blob):
+        return True
+    if nom and re.search(r"\d", nom):
+        return True
+    if re.search(r"[ØøΦφ⌀∅]", nom) and re.search(r"\d", nom + tol + blob):
+        return True
+    if lo or hi:
+        return bool(nom or re.search(r"\d", tol))
+    return False
+
+
+def _enrich_all_balloon_report_fields(payload: dict) -> None:
+    payload["balloon_items"] = [
+        _enrich_balloon_item_report_fields(it) for it in (payload.get("balloon_items") or [])
+    ]
+
+
+def _drop_invalid_report_balloons(payload: dict, extra_invalid: set | None = None) -> None:
+    """Remove balloons with no report data from drawing, table, and inspection report."""
+    items = list(payload.get("balloon_items") or [])
+    dets = list(payload.get("detections") or [])
+    full = list(payload.get("detections_full") or [])
+    if not items or not dets:
+        return
+    invalid = set(extra_invalid or [])
+    by_di: dict[int, list] = {}
+    for it in items:
+        di = it.get("detection_index")
+        if isinstance(di, int):
+            by_di.setdefault(di, []).append(it)
+
+    keep: list[int] = []
+    dropped = 0
+    for i in range(len(dets)):
+        group = by_di.get(i, [])
+        bn = str((group[0] or {}).get("balloon_number") if group else "")
+        if bn in invalid or str(i + 1) in invalid:
+            dropped += 1
+            continue
+        ok = any(_item_valid_for_inspection_report(it) for it in group) if group else False
+        if ok:
+            keep.append(i)
+        else:
+            dropped += 1
+    if len(keep) == len(dets):
+        payload["balloons_dropped_report"] = dropped
+        return
+
+    remap = {old: new for new, old in enumerate(keep)}
+    payload["detections"] = [dets[i] for i in keep]
+    if len(full) == len(dets):
+        payload["detections_full"] = [full[i] for i in keep]
+    new_items: list = []
+    for it in items:
+        di = it.get("detection_index")
+        if not isinstance(di, int) or di not in remap:
+            continue
+        row = _enrich_balloon_item_report_fields(it)
+        row["detection_index"] = remap[di]
+        row["balloon_number"] = remap[di] + 1
+        new_items.append(row)
+    payload["balloon_items"] = new_items
+    payload["drawing_annotations"] = _drawing_annotations_from_detections(payload["detections"])
+    payload["count"] = len(payload["detections"])
+    payload["balloons_dropped_report"] = dropped
+    print(
+        f"[detect] Report integrity: dropped {dropped} balloon(s) without nominal/tolerance; "
+        f"renumbered 1..{len(keep)}."
+    )
+
+
+def _gpt_report_integrity_audit(payload: dict) -> None:
+    """
+    Final GPT agent: cross-check every balloon row against inspection report rules.
+    Applies corrections; flags invalid rows for removal.
+    """
+    if _deploy_safe_mode() or not _openai_api_key():
+        return
+    items = list(payload.get("balloon_items") or [])
+    if not items:
+        return
+    rows = []
+    for it in items:
+        it2 = _enrich_balloon_item_report_fields(it)
+        rows.append(
+            {
+                "balloon_number": it2.get("balloon_number"),
+                "class_name": it2.get("class_name"),
+                "nominal": it2.get("nominal_value"),
+                "tol_low": it2.get("tol_low"),
+                "tol_high": it2.get("tol_high"),
+                "tolerance": it2.get("tolerance"),
+                "raw_ocr": (it2.get("raw_ocr") or "")[:160],
+            }
+        )
+    prompt = (
+        "You are the FINAL inspection report QC agent for mechanical drawing ballooning.\n"
+        "Validate rows by PATTERN (shape of callout), NOT by specific example numbers.\n"
+        f"{_mechanical_ballooning_prompts().report_integrity_pattern_rules()}\n"
+        f"ROWS JSON:\n{json.dumps(rows, indent=2)}\n\n"
+        "Return ONLY JSON:\n"
+        '{"invalid_balloon_numbers":[3,9],'
+        '"corrections":[{"balloon_number":5,"nominal":"45","tol_low":"","tol_high":"","tolerance":""}]}\n'
+        "invalid_balloon_numbers: balloons to REMOVE (no report data).\n"
+        "corrections: fix OCR mistakes only when you are certain."
+    )
+    raw = _openai_text_chat_direct(prompt, max_tokens=4096, temperature=0.0)
+    if str(raw).strip().startswith("VISION_LLM_FAILED"):
+        payload["report_integrity_audit_error"] = str(raw).strip()[:300]
+        return
+    parsed = _parse_json_object_from_llm(raw)
+    if not isinstance(parsed, dict):
+        payload["report_integrity_audit_error"] = "unparseable response"
+        return
+
+    invalid: set[str] = set()
+    for v in parsed.get("invalid_balloon_numbers") or []:
+        invalid.add(str(v))
+
+    by_bn: dict[str, dict] = {}
+    for it in items:
+        by_bn[str(it.get("balloon_number"))] = it
+
+    for fix in parsed.get("corrections") or []:
+        if not isinstance(fix, dict):
+            continue
+        bn = str(fix.get("balloon_number") or "")
+        if bn not in by_bn:
+            continue
+        row = by_bn[bn]
+        if fix.get("nominal") is not None:
+            row["nominal_value"] = str(fix.get("nominal") or "").strip()
+        if fix.get("tolerance") is not None:
+            row["tolerance"] = str(fix.get("tolerance") or "").strip()
+        if fix.get("tol_low") is not None or fix.get("tol_high") is not None:
+            lo = str(fix.get("tol_low") or "").strip()
+            hi = str(fix.get("tol_high") or "").strip()
+            row["tol_low"] = lo
+            row["tol_high"] = hi
+            if lo or hi:
+                if lo and hi and lo.startswith("-") and not hi.startswith("-"):
+                    row["tolerance"] = f"+{hi.lstrip('+')}/{lo}"
+                elif lo.startswith("-") and hi:
+                    row["tolerance"] = f"±{hi.lstrip('+')}"
+        row.update(_enrich_balloon_item_report_fields(row))
+        if bn in invalid and _item_valid_for_inspection_report(row):
+            invalid.discard(bn)
+
+    payload["balloon_items"] = list(by_bn.values())
+    payload["report_integrity_audit"] = {
+        "invalid_count": len(invalid),
+        "corrections_applied": len(parsed.get("corrections") or []),
+    }
+    _drop_invalid_report_balloons(payload, extra_invalid=invalid)
+
+
+def _hide_incomplete_balloons(payload: dict) -> None:
+    """Report/drawing sync: GPT cross-check then drop rows without nominal/tolerance."""
+    _enrich_all_balloon_report_fields(payload)
+    _gpt_report_integrity_audit(payload)
+    if not payload.get("report_integrity_audit"):
+        _drop_invalid_report_balloons(payload)
+
+
+def _drop_empty_value_detections(payload: dict) -> None:
+    """
+    Post-OCR quality gate: dimension validity + geometry false-positive filter,
+    then renumber 1..n. Drops boxes with no number, X/Y/Z arrows, SECTION/DETAIL
+    labels, empty reads, or geometry-only hits (huge box, no text ink).
+
+    Detections whose OCR was never attempted (Render safe cap) are kept.
+    """
+    items = list(payload.get("balloon_items") or [])
+    dets = list(payload.get("detections") or [])
+    full = list(payload.get("detections_full") or [])
+    if not items or not dets:
+        return
+
+    by_di: dict[int, list] = {}
+    for it in items:
+        di = it.get("detection_index")
+        if isinstance(di, int):
+            by_di.setdefault(di, []).append(it)
+
+    keep: list[int] = []
+    dropped_validity = 0
+    dropped_geometry = 0
+    for i in range(len(dets)):
+        group = by_di.get(i, [])
+        read_attempted = any(it.get("text_read_attempted", True) for it in group)
+        if not read_attempted:
+            keep.append(i)
+            continue
+        det_bb = (dets[i] or {}).get("bbox") or []
+        ok = False
+        for it in group:
+            if not _item_has_measurable_value(it):
+                continue
+            if _is_geometry_false_positive(it, det_bb):
+                continue
+            ok = True
+            break
+        if ok:
+            keep.append(i)
+        elif group:
+            if any(not _item_has_measurable_value(it) for it in group):
+                dropped_validity += 1
+            else:
+                dropped_geometry += 1
+    if len(keep) == len(dets):
+        payload["balloons_dropped_validity"] = 0
+        payload["balloons_dropped_geometry"] = 0
+        return
+    dropped = len(dets) - len(keep)
+
+    remap = {old: new for new, old in enumerate(keep)}
+    payload["detections"] = [dets[i] for i in keep]
+    if len(full) == len(dets):
+        payload["detections_full"] = [full[i] for i in keep]
+    new_items: list = []
+    for it in items:
+        di = it.get("detection_index")
+        if not isinstance(di, int) or di not in remap:
+            continue
+        row = dict(it)
+        row["detection_index"] = remap[di]
+        row["balloon_number"] = remap[di] + 1
+        new_items.append(row)
+    payload["balloon_items"] = new_items
+    payload["drawing_annotations"] = _drawing_annotations_from_detections(payload["detections"])
+    payload["count"] = len(payload["detections"])
+    payload["balloons_dropped_no_data"] = dropped
+    payload["balloons_dropped_validity"] = dropped_validity
+    payload["balloons_dropped_geometry"] = dropped_geometry
+    print(
+        f"[detect] Quality filter: dropped {dropped} balloon(s) "
+        f"(validity={dropped_validity}, geometry={dropped_geometry}); "
+        f"renumbered 1..{len(keep)}."
+    )
+
+
+def _apply_text_bbox_balloon_placement(payload: dict) -> None:
+    """Place balloons beside OCR text ink bbox (not the full YOLO geometry box)."""
+    items = list(payload.get("balloon_items") or [])
     anns = list(payload.get("drawing_annotations") or [])
-    for i in range(len(anns)):
-        if i in skip_di:
-            row = dict(anns[i])
-            row["canvas_skip"] = True
-            anns[i] = row
+    dets = list(payload.get("detections") or [])
+    if not items or not anns:
+        return
+    placed = 0
+    for it in items:
+        if _is_sub_balloon_item(it):
+            continue
+        di = it.get("detection_index")
+        tbb = it.get("text_bbox_pixels")
+        if not isinstance(di, int) or di < 0 or di >= len(anns):
+            continue
+        if not tbb or len(tbb) < 4:
+            continue
+        d = dets[di] if di < len(dets) else {}
+        tp = _tight_balloon_text_pos(
+            tbb,
+            orientation=(d or {}).get("dimension_orientation") or it.get("dimension_orientation"),
+            balloon_side=(d or {}).get("balloon_side") or it.get("balloon_side"),
+        )
+        if not tp:
+            continue
+        row = dict(anns[di])
+        row["TextPos"] = [int(tp[0]), int(tp[1])]
+        row["text_bbox"] = [int(v) for v in tbb[:4]]
+        anns[di] = row
+        placed += 1
     payload["drawing_annotations"] = anns
-    payload["balloons_hidden_no_data"] = len(skip_di)
+    payload["balloon_placement"] = "text_bbox"
+    payload["balloons_text_bbox_placed"] = placed
 
 
 def _detected_text_from_fields(nominal: str, tolerance: str) -> str:
@@ -3475,6 +4533,11 @@ def _title_block_meta_from_text(text: str) -> dict[str, str]:
         return ""
 
     return {
+        "drawing_number": pick(
+            [
+                r"(?:drawing\s*(?:no|number|#)|dwg\s*(?:no|#)?)\s*[:.\-]?\s*([A-Za-z0-9][A-Za-z0-9\-_/]*)",
+            ]
+        ),
         "part_number": pick(
             [
                 r"(?:part\s*(?:no|number|#)|drawing\s*(?:no|number|#)|dwg\s*(?:no|#)?)\s*[:.\-]?\s*([A-Za-z0-9][A-Za-z0-9\-_/]*)",
@@ -3489,6 +4552,17 @@ def _title_block_meta_from_text(text: str) -> dict[str, str]:
         "revision": pick(
             [
                 r"(?:rev(?:ision)?|issue)\s*[:.\-]?\s*([A-Za-z0-9]+)",
+            ]
+        ),
+        "change_number": pick(
+            [
+                r"(?:change\s*(?:no|number|#)|chg\s*(?:no|#)?)\s*[:.\-]?\s*([A-Za-z0-9][\w\-/]*)",
+            ]
+        ),
+        "date": pick(
+            [
+                r"(?:date)\s*[:.\-]?\s*(\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4})",
+                r"\b(\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4})\b",
             ]
         ),
         "material": pick(
@@ -3535,14 +4609,18 @@ def _vision_title_block_json(crop: np.ndarray) -> dict[str, str]:
             (
                 "You are reading an engineering drawing TITLE BLOCK (OCR-quality accuracy required).\n"
                 "Extract these fields exactly as printed on the drawing:\n"
-                "1. Part Number (drawing/part no., DWG NO)\n"
-                "2. Part Name (title, description, name)\n"
-                "3. Revision (REV, issue)\n"
-                "4. Material (MATL)\n"
-                "5. Mass or Weight (with units if shown)\n"
-                "6. Finish Treatment (surface finish, coating, heat treat, etc.)\n"
+                "1. Drawing Number (DWG NO, drawing no.)\n"
+                "2. Part Number\n"
+                "3. Part Name (title, description, name)\n"
+                "4. Revision (REV, issue)\n"
+                "5. Change Number (CHG NO)\n"
+                "6. Date\n"
+                "7. Material (MATL)\n"
+                "8. Mass or Weight (with units if shown)\n"
+                "9. Finish Treatment (surface finish, coating, heat treat, etc.)\n"
                 'Return ONLY valid JSON, no markdown:\n'
-                '{"part_number":"","part_name":"","revision":"","material":"","mass":"","finish_treatment":""}\n'
+                '{"drawing_number":"","part_number":"","part_name":"","revision":"",'
+                '"change_number":"","date":"","material":"","mass":"","finish_treatment":""}\n'
                 "Use empty string only when the field is truly not visible."
             ),
             max_tokens=800,
@@ -3558,9 +4636,12 @@ def _vision_title_block_json(crop: np.ndarray) -> dict[str, str]:
                 data = json.loads(t)
                 if isinstance(data, dict):
                     for key in (
+                        "drawing_number",
                         "part_number",
                         "part_name",
                         "revision",
+                        "change_number",
+                        "date",
                         "material",
                         "mass",
                         "finish_treatment",
@@ -3765,10 +4846,65 @@ def _exact_crop_jpeg_data_url(bgr, max_side: int = 8192) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
 
 
-def _extract_detection_text_llm(image_path: str, detections: list) -> list:
+def _vector_pdf_text_enabled() -> bool:
+    """Read exact dimension text from vector/CAD PDFs (no OCR). Default ON."""
+    return os.environ.get("BALLOON_VECTOR_PDF_TEXT", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _parsed_from_vector_text(text: str, class_name: str) -> dict[str, str]:
+    """Build the same parsed dict the OCR path returns, from exact vector-PDF text."""
+    t = (text or "").strip()
+    out = {
+        "nominal_value": "",
+        "tolerance": "",
+        "others": t[:2000],
+        "feature_type": "",
+        "view_location": "",
+        "inspection_method": "",
+        "remarks": "",
+        "raw_ocr": t[:2000],
+    }
+    if not t:
+        return out
+    hint = _parse_dimension_text(t)
+    out["nominal_value"] = hint.get("nominal_value", "")
+    out["tolerance"] = hint.get("tolerance", "")
+    cls = (class_name or "").lower()
+    if ("gdt" in cls or "gd" in cls) and not out["nominal_value"] and out["tolerance"]:
+        out["nominal_value"], out["tolerance"] = out["tolerance"], ""
+    return out
+
+
+def _vector_text_unusable(parsed: dict, vtext: str, class_name: str) -> bool:
     """
-    Vision LLM on each YOLO bbox crop only (never the full sheet). Returns structured fields
-    plus a JPEG data URL thumbnail of the crop for the UI.
+    True when the vector-PDF text for a value-bearing box (dimension/GD&T/etc.)
+    produced no nominal/tolerance — e.g. CAD symbol fonts (Ø drawn via %%c or a
+    shape font) that PyMuPDF cannot decode, or text plotted as curves. In that
+    case the crop must go through OCR instead.
+    """
+    if parsed.get("nominal_value") or parsed.get("tolerance"):
+        return False
+    cls = (class_name or "").lower()
+    value_class = any(
+        k in cls
+        for k in ("dimension", "gd", "thread", "chamfer", "radius", "special", "weld", "surface")
+    )
+    return value_class or len((vtext or "").strip()) < 3
+
+
+def _extract_detection_text_llm(
+    image_path: str, detections: list, pdf_path: str | None = None, page_num: int = 0
+) -> list:
+    """
+    Read dimension text for each YOLO bbox. For vector/CAD PDFs the exact text is read
+    directly from the PDF (no OCR, no misreads, handles vertical text). For scanned
+    images, or boxes with no vector text, it falls back to OCR (Claude / Tesseract).
+    Also returns a JPEG data URL thumbnail of the crop for the UI.
     """
     img = _imread_bgr(image_path)
     if img is None:
@@ -3778,7 +4914,28 @@ def _extract_detection_text_llm(image_path: str, detections: list) -> list:
     max_ocr = _max_crop_ocr_count()
     if _deploy_safe_mode():
         print(f"[detect] Render safe mode: OCR on first {max_ocr} crops only (set BALLOON_MAX_CROP_OCR).")
-    for i, d in enumerate(detections or [], start=1):
+
+    dets_list = list(detections or [])
+    vector_texts: list = [None] * len(dets_list)
+    use_vector = bool(
+        _vector_pdf_text_enabled()
+        and pdf_path
+        and pdf_vector_text.is_pdf(pdf_path)
+        and pdf_vector_text.pdf_has_vector_text(pdf_path, page_num)
+    )
+    if use_vector:
+        try:
+            vector_texts = pdf_vector_text.extract_box_texts(pdf_path, w, h, dets_list, page_num)
+            n_found = sum(1 for t in vector_texts if t)
+            print(
+                f"[detect] Vector PDF text: read {n_found}/{len(vector_texts)} boxes "
+                "directly from the PDF (no OCR)."
+            )
+        except Exception as exc:
+            print(f"[detect] Vector PDF text extraction failed: {exc}")
+            vector_texts = [None] * len(dets_list)
+
+    for i, d in enumerate(dets_list, start=1):
         bb = d.get("bbox") or []
         if len(bb) < 4:
             continue
@@ -3807,9 +4964,34 @@ def _extract_detection_text_llm(image_path: str, detections: list) -> list:
             "inspection_method": "",
             "remarks": "",
         }
-        run_ocr = max_ocr <= 0 or i <= max_ocr
-        if run_ocr:
-            parsed = _ocr_first_parse_crop(crop, cls, dim_ori)
+        vtext = vector_texts[i - 1] if (i - 1) < len(vector_texts) else None
+        vparsed = None
+        text_source = ""
+        text_read_attempted = False
+        if vtext:
+            # Exact text from the vector PDF — most accurate, free, no OCR cap.
+            vparsed = _parsed_from_vector_text(vtext, cls)
+            parsed = vparsed
+            text_source = "vector_pdf"
+            text_read_attempted = True
+        if vparsed is None or _vector_text_unusable(vparsed, vtext, cls):
+            # No vector text, or it decoded to something with no value (symbol
+            # fonts / outlined text) — OCR the crop instead.
+            run_ocr = max_ocr <= 0 or i <= max_ocr
+            if run_ocr:
+                text_read_attempted = True
+                ocr_parsed = _ocr_first_parse_crop(crop, cls, dim_ori)
+                keep_vector = (
+                    vparsed is not None
+                    and not ocr_parsed.get("nominal_value")
+                    and not ocr_parsed.get("tolerance")
+                    and not (ocr_parsed.get("others") or "").strip()
+                )
+                if not keep_vector:
+                    parsed = ocr_parsed
+                    text_source = _ocr_engine()
+            if not text_source:
+                text_source = _ocr_engine()
         nominal_value = parsed["nominal_value"]
         tolerance = parsed["tolerance"]
         others = parsed["others"]
@@ -3822,6 +5004,16 @@ def _extract_detection_text_llm(image_path: str, detections: list) -> list:
         region_name = (d.get("region_name") or "").strip()
         if not view_location and region_name:
             view_location = region_name
+        text_bbox_pixels: list | None = None
+        if text_read_attempted and crop is not None and getattr(crop, "size", 0):
+            crop_tbb = _extract_text_bbox_in_crop(crop, dim_ori)
+            if crop_tbb and len(crop_tbb) >= 4:
+                text_bbox_pixels = [
+                    x1 + int(crop_tbb[0]),
+                    y1 + int(crop_tbb[1]),
+                    x1 + int(crop_tbb[2]),
+                    y1 + int(crop_tbb[3]),
+                ]
         items.append(
             {
                 "balloon_number": i,
@@ -3836,11 +5028,14 @@ def _extract_detection_text_llm(image_path: str, detections: list) -> list:
                 "tolerance": tolerance,
                 "others": others,
                 "raw_ocr": (parsed.get("raw_ocr") or "").strip(),
-                "ocr_engine": _ocr_engine(),
+                "ocr_engine": text_source,
+                "text_read_attempted": text_read_attempted,
+                "dimension_orientation": dim_ori,
                 "confirmed": False,
                 "region_name": region_name,
                 "detected_text": detected_text,
                 "bbox_pixels": [x1, y1, x2, y2],
+                "text_bbox_pixels": text_bbox_pixels,
                 "crop_preview_base64": crop_preview_base64,
                 "crop_save_base64": crop_save_base64,
             }
@@ -3995,17 +5190,40 @@ def _run_detection_pipeline(dest_path: str, work_dir: str, filename: str) -> tup
     _mark_yolo_detection_sources(payload)
     payload["yolo_after_filter_count"] = payload.get("count")
     payload["pipeline_stage"] = "yolo_complete"
+    if payload.get("drawing_analysis") is None:
+        payload["drawing_analysis"] = {}
+    if payload.get("detection_meta") is None:
+        payload["detection_meta"] = {}
+    if payload.get("preprocess_meta") is None:
+        payload["preprocess_meta"] = {}
     _anthropic_region_prepass(payload)
     _opencv_dim_line_stage(payload)
     _apply_vision_fallback_if_needed(payload)
     _anthropic_coverage_verify(payload)
+    _openai_coverage_cross_check(payload)
     _refine_dimension_detection_payload(payload)
     _reorder_detection_payload_tblr(payload)
     dets = payload.get("detections") or []
     payload["drawing_annotations"] = _drawing_annotations_from_detections(dets)
     extract_path = payload.get("infer_image_path") or dest_path
     dets_for_crop = payload.get("detections_full") or dets
-    payload["balloon_items"] = _extract_detection_text_llm(extract_path, dets_for_crop)
+    # Original uploaded file: vector PDFs let us read exact dimension text (no OCR).
+    src_pdf = dest_path if (payload.get("input_kind") == "pdf") else None
+    payload["balloon_items"] = _extract_detection_text_llm(
+        extract_path, dets_for_crop, pdf_path=src_pdf, page_num=0
+    )
+    # OCR normalization → engineering parser → feature association
+    try:
+        from drawing_pipeline.ocr_normalize import normalize_ocr_item
+        from drawing_pipeline.engineering import associate_features, parse_engineering_item
+
+        normalized = [parse_engineering_item(normalize_ocr_item(it)) for it in payload["balloon_items"]]
+        payload["balloon_items"] = associate_features(normalized)
+    except Exception as exc:
+        payload["ocr_normalize_error"] = str(exc)[:200]
+    # Post-OCR: validity (must have number, reject X/Y/Z, SECTION/DETAIL, empty)
+    # + geometry false-positive filter, then renumber 1..n.
+    _drop_empty_value_detections(payload)
     _expand_multiplier_balloons_payload(payload)
     _remove_duplicate_yolo_detections_near_multiplier(payload)
     _repair_multiplier_drawing_annotations(payload)
@@ -4014,8 +5232,47 @@ def _run_detection_pipeline(dest_path: str, work_dir: str, filename: str) -> tup
     else:
         payload["balloon_placement"] = "tight"
     _sync_balloon_items_from_detections(payload)
+    # Balloon placement anchored to OCR text ink bbox (not full YOLO geometry box).
+    _apply_text_bbox_balloon_placement(payload)
     _hide_incomplete_balloons(payload)
+    # Quality control + coverage metrics
+    try:
+        from drawing_pipeline.quality import compute_coverage_metrics, run_quality_control
+
+        run_quality_control(payload)
+        compute_coverage_metrics(payload, payload.get("drawing_analysis"))
+    except Exception as exc:
+        payload["quality_control_error"] = str(exc)[:200]
     payload["balloon_pipeline_complete"] = True
+    payload["pipeline_steps"] = [
+        "drawing_analysis",
+        "vector_vs_scan_routing",
+        "render_600dpi",
+        "image_analysis_agent",
+        "adaptive_preprocess",
+        "multi_image_generator",
+        "adaptive_detection_yolo_multiscale_sahi_300",
+        "detection_fusion",
+        "bbox_refinement",
+        "claude_gap_fill",
+        "claude_coverage_verify",
+        "gpt4o_audit",
+        "native_pdf_text_or_ocr",
+        "ocr_rotations_0_90_180_270",
+        "text_bbox_extraction",
+        "ocr_normalization",
+        "engineering_parser",
+        "feature_association",
+        "dimension_validity_filter",
+        "geometry_false_positive_filter",
+        "quality_control",
+        "coverage_verification",
+        "balloon_placement_text_bbox",
+        "collision_avoidance_ui",
+        "report_integrity_gpt_audit",
+        "renumber_1_to_n",
+        "inspection_report",
+    ]
     payload["title_block_meta"] = _extract_title_block_meta(extract_path, dets_for_crop)
     payload["extraction_prompt"] = (
         "yolo_render_safe" if _deploy_safe_mode() else "yolo_balloons_then_claude_grid_gap_fill_ocr"
@@ -4397,6 +5654,16 @@ def payment_verify(
 
 if __name__ == "__main__":
     import uvicorn
+
+    # Packaged exe (or SMORX_REQUIRE_ACTIVATION=1): enforce license + machine binding.
+    if getattr(sys, "frozen", False) or os.environ.get(
+        "SMORX_REQUIRE_ACTIVATION", ""
+    ).strip().lower() in ("1", "true", "yes"):
+        from licensing.prompt import ensure_activated
+
+        if not ensure_activated():
+            print("Activation required. Exiting.")
+            raise SystemExit(1)
 
     host = os.environ.get("BALLOON_UI_HOST", "127.0.0.1")
     port = int(os.environ.get("BALLOON_UI_PORT", "10000"))

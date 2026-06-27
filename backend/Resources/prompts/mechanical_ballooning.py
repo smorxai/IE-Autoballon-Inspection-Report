@@ -78,6 +78,71 @@ OUTPUT_TABLE_COLUMNS = (
     "View Location | Inspection Method | Remarks"
 )
 
+# Pattern-based rules: digits/letters CHANGE on every drawing — match SHAPE, not fixed examples.
+CALLOUT_PATTERN_RULES = """
+PATTERN-BASED READING (critical):
+Numbers and letters CHANGE on every drawing. Match the PATTERN/SHAPE — never memorize example values.
+Examples below show pattern shape only; your output must use the EXACT characters visible in the crop.
+
+PATTERNS TO RECOGNIZE (any digits/letters that fit the pattern):
+
+1. LINEAR DIMENSION: <number> [optional ± tolerance]
+   Pattern: integer or decimal; may be rotated 90°/any angle.
+   Tolerance patterns: ±<n>, +<upper>/<lower> stacked, or plain number only.
+
+2. REFERENCE DIMENSION: (<number>) — parentheses around a number; no tolerance.
+
+3. DIAMETER: Ø<number> or DIA<number>; optional quantity prefix (N)X or N X before it → put prefix in others.
+
+4. RADIUS: R<number> where R is followed by digits (NOT Ra/Rz surface finish).
+
+5. SURFACE FINISH: R[a|z|t]<number> e.g. Ra<any>, Rz<any> — letter a/z/t immediately after R.
+
+6. WELD THROAT (fillet): lowercase "a" + space + <number> — ANY number (a 3, a 5, a 12, a 4,5).
+   May appear once OR duplicated above+below reference line (read once).
+   With fillet triangle, weld-all-around circle, dashed ID line — still pattern "a <number>".
+   nominal_value = full "a <number>"; feature_type = Weld.
+
+7. QUANTITY + FEATURE: (N)X or N X before a dimension — N is any integer ≥ 2.
+
+8. GD&T FRAME: symbol box + <tolerance number> + optional datum letters — any decimal value.
+
+9. BASIC DIMENSION: <number> inside square/rectangular box — any number; no tolerance.
+
+10. DATUM / SECTION / DETAIL: single uppercase letter A–Z with pointer (not lone X/Y/Z).
+
+11. ± TOLERANCE: <nominal> ± <value> — any numbers; ± may have no space before tolerance digit.
+
+12. STACKED TOLERANCE: <nominal> with +<upper> above and <lower> below (or +upper/lower text).
+
+13. TITLE BLOCK / METADATA: alphanumeric codes — drawing no, part no, revision, change no, mass, date.
+    Mass pattern: = <number> = ; revision may be single letter; date DD.MM.YYYY or similar.
+
+14. COMMA DECIMAL (ISO): in ANY numeric pattern above, comma is decimal separator (30,5 → 30.5).
+
+Always transcribe EXACTLY what is printed. Apply the matching pattern; do not substitute example numbers.
+"""
+
+
+def report_integrity_pattern_rules() -> str:
+    """Pattern rules for GPT report QC — valid row shapes, not fixed values."""
+    return (
+        "VALID ROW PATTERNS (any digits/letters fitting the pattern — do NOT reject because "
+        "the number differs from training examples):\n"
+        "- Linear: nominal = any number; tol optional.\n"
+        "- Reference: nominal = number from (<number>) parentheses.\n"
+        "- Diameter: nominal = Ø<number>; qty (N)X in others if present.\n"
+        "- Radius: nominal = R<number> (not Ra).\n"
+        "- Surface finish: nominal = Ra<number> or Rz<number>.\n"
+        "- Weld: nominal = a <number> (any number); feature Weld.\n"
+        "- GD&T: nominal = tolerance value (any decimal).\n"
+        "- Basic: nominal = any number in box.\n"
+        "- Metadata: drawing/part/rev/change/mass/date — any readable code.\n"
+        "- Mass: = <number> = pattern.\n"
+        "- Comma decimals: treat as dot in nominal/tolerance.\n"
+        "REJECT only: empty rows, lone X/Y/Z, SECTION/DETAIL labels with no value, geometry with no text.\n"
+    )
+
 
 def crop_extraction_prompt(class_name: str, orientation: str = "") -> str:
     """Per-crop OCR structuring — no guessing, no invented values."""
@@ -98,11 +163,12 @@ def crop_extraction_prompt(class_name: str, orientation: str = "") -> str:
         f"{ori_note}\n"
         "STRICT RULES:\n"
         "- Copy ONLY characters you can clearly read in this image.\n"
-        "- Dimension numbers MUST go in nominal_value (e.g. 38, 120, Ø30, R10).\n"
+        "- Put the main callout value in nominal_value; tolerances in tolerance; qty prefix in others.\n"
         "- Do NOT invent dimensions, tolerances, view names, or inspection methods.\n"
         "- If text is unclear, use empty strings — never guess.\n"
         "- Do NOT add metadata not visible in the crop (no 'Front View' unless written).\n"
         "- Preserve symbols exactly: Ø, ±, °, R, 2X, THRU, H7, C, ×.\n\n"
+        f"{CALLOUT_PATTERN_RULES}\n\n"
         'Return ONLY valid JSON (no markdown):\n'
         "{\n"
         '  "feature_type": "Linear|Diameter|Radius|Fillet|Angular|Chamfer|Arc|Hole|GD&T|Datum|'
@@ -115,6 +181,7 @@ def crop_extraction_prompt(class_name: str, orientation: str = "") -> str:
         '  "others": "quantity prefix 2X/3X, THRU, thread spec, surface finish text"\n'
         "}\n"
         "Rules:\n"
+        "- Match PATTERN type from list above; use exact OCR text for nominal/tolerance.\n"
         "- Dimensions: nominal_value = size; tolerance = limits; 2X/nX in others.\n"
         "- Angular/Chamfer: include ° and C-values exactly (e.g. 45°, C2 × 45°, 30° ±1°); feature_type Angular or Chamfer.\n"
         "- Arc/Curve: R and arc length in nominal_value; feature_type Arc.\n"
@@ -171,6 +238,10 @@ def anthropic_gap_fill_after_yolo_prompt(
         "- HORIZONTAL dimensions (left↔right): width, spacing, Ø callouts on horizontal lines.\n"
         "- VERTICAL dimensions (top↔bottom): height, depth, thickness — text often rotated 90° "
         "(e.g. 60, 38, 12, 40, 20, 80). You MUST include vertical callouts; do not skip them.\n"
+        "- ANGLED / ROTATED dimensions at ANY angle: aligned dimensions along slanted edges, "
+        "isometric-view callouts (text tilted ~30°/45°/60°), chamfer leaders, diagonal "
+        "dimension lines. Rotated text is STILL a dimension — box it like any other. "
+        "Do not skip a number just because it is not horizontal or vertical.\n"
         "- Compare each callout to YOLO boxes below. If already covered, SKIP (no duplicate).\n\n"
         "YOLO ALREADY DETECTED (do NOT duplicate these regions):\n"
         f"{yolo_boxes_text or '(none listed)'}\n\n"
@@ -189,7 +260,8 @@ def anthropic_gap_fill_after_yolo_prompt(
         "- Box tight around readable TEXT/SYMBOLS only (not bare extension lines).\n"
         "- Do NOT invent values or boxes. If unsure, omit.\n"
         "- confidence \"high\" only when digits/symbols are clearly readable.\n"
-        "- NOTES: one box for full notes block if missing. Title block / revision: one box each if missing.\n\n"
+        "- NOTES: one box for full notes block if missing. Title block / revision: one box each if missing.\n"
+        "- Detect by PATTERN not fixed numbers: weld a<any>, Ra<any>, Ø<any>, (N)X, (<num>), = <num> =, etc.\n\n"
         "Return ONLY valid JSON (no markdown), this exact shape:\n"
         "{\n"
         '  "detections": [\n'
@@ -224,16 +296,66 @@ def anthropic_coverage_verify_prompt(
     return (
         "You are a QC mechanical engineer verifying ballooning on a drawing.\n\n"
         "YOLO and a first Claude pass already placed balloons. Your job: find ANY "
-        "visible dimension/callout still WITHOUT a balloon (horizontal OR vertical).\n\n"
+        "visible dimension/callout still WITHOUT a balloon — horizontal, vertical, "
+        "OR rotated at any angle.\n\n"
         f"Scan the full sheet in a {grid_cols}x{grid_rows} grid (left→right, top→bottom). "
-        "Check every cell. Include vertical rotated dimensions (60, 38, 12, 40, 20) and "
-        "horizontal (120, 90, 15, 80, R10, R6, Ø30, 2X Ø11, etc.).\n\n"
+        "Check every cell. Include ANY readable callout matching standard patterns: "
+        "linear numbers, Ø<any>, R<any>, Ra<any>, a<any> weld throat, (N)X qty, "
+        "(<num>) reference, ± tolerances, GD&T frames, title-block fields, rotated text at any angle.\n\n"
         "ALREADY BALLOONED (do NOT duplicate):\n"
         f"{balloon_boxes_text or '(none)'}\n\n"
         "Return ONLY NEW missed callouts as JSON (empty list if complete):\n"
         '{"detections":[{"class_name":"Dimensions","x_min":0,"y_min":0,"x_max":0,"y_max":0,'
         '"confidence":"high","description":"e.g. 38 vertical"}]}\n'
         "Do not invent. confidence high only when clearly readable."
+    )
+
+
+def gpt_cross_check_audit_prompt(
+    balloon_boxes_text: str,
+    grid_cols: int = 8,
+    grid_rows: int = 6,
+) -> str:
+    """
+    Final layer-3 audit (different model family than the detector): verify the
+    finished balloon set BOTH ways — find missed callouts AND flag boxes that are
+    not real callouts (extra balloons).
+    """
+    return (
+        "You are the FINAL QC auditor for ballooning on a mechanical engineering drawing.\n"
+        "An automatic system (YOLO + Claude) already placed balloon boxes, listed below.\n"
+        "Audit the result in BOTH directions:\n\n"
+        "A) MISSED — any visible dimension/callout still WITHOUT a balloon:\n"
+        f"   Scan the full sheet in a {grid_cols}x{grid_rows} grid (left→right, top→bottom).\n"
+        "   Include horizontal, vertical (text rotated 90°), AND angled/slanted dimensions\n"
+        "   at any angle (isometric callouts, aligned dims on inclined edges, diagonal\n"
+        "   dimension lines), GD&T frames, datums, surface finish (Ra<any>), weld (a<any>),\n"
+        "   title-block metadata. Match callout PATTERN — digits/letters change per drawing.\n"
+        "   Never skip readable text because of rotation or because the number differs from examples.\n\n"
+        "B) FALSE / EXTRA — listed boxes that do NOT contain a real callout:\n"
+        "   e.g. empty whitespace, bare geometry/extension lines with no text, hatching,\n"
+        "   or an exact duplicate box on the SAME callout as another listed box.\n\n"
+        "EXISTING BALLOON BOXES (#index class [x1,y1,x2,y2] in this image's pixel space):\n"
+        f"{balloon_boxes_text or '  (none)'}\n\n"
+        "RULES:\n"
+        "- missed: box tight around readable text/symbols only. Do NOT invent callouts.\n"
+        '  confidence "high" only when digits/symbols are clearly readable.\n'
+        "- false_positives: refer to boxes by their #index number. Flag with confidence\n"
+        '  "high" ONLY when you are CERTAIN the box contains no readable callout.\n'
+        "  When in doubt, do NOT flag — removing a real balloon is worse than keeping it.\n\n"
+        "Return ONLY valid JSON (no markdown), exactly this shape:\n"
+        "{\n"
+        '  "missed": [\n'
+        '    {"class_name": "Dimensions", "x_min": 0, "y_min": 0, "x_max": 0, "y_max": 0,\n'
+        '     "confidence": "high", "description": "e.g. 45 angled isometric"}\n'
+        "  ],\n"
+        '  "false_positives": [\n'
+        '    {"index": 3, "confidence": "high", "reason": "empty area, no text"}\n'
+        "  ]\n"
+        "}\n"
+        "Both lists may be empty. class_name must be one of: Dimensions, GDnT, Notes,\n"
+        "Title_Block, Special_Characteristics, Datums, Welding_Symbols,\n"
+        "Surface_Finish_Symbols, Revision_Table, Miscellaneous."
     )
 
 

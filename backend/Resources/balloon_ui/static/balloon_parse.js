@@ -2,40 +2,145 @@
  * Shared parsing for balloon nominal / tolerance (Detected details + Inspection report).
  */
 (function (global) {
+  function normalizeEuropeanDecimal(s) {
+    var t = String(s || "").trim();
+    if (!t) return t;
+    var prev = null;
+    while (prev !== t) {
+      prev = t;
+      t = t.replace(/(\d),(\d{1,3})(?!\d)/g, "$1.$2");
+    }
+    return t;
+  }
+
+  function extractQuantityPrefix(s) {
+    var t = String(s || "").trim();
+    var m = t.match(/^\(\s*(\d+)\s*[xX×]\s*\)\s*(.*)$/);
+    if (m) return { rest: m[2].trim(), qty: "(" + m[1] + "X)" };
+    m = t.match(/^(\d+)\s*[xX×]\s+(.*)$/);
+    if (m && parseInt(m[1], 10) >= 2) return { rest: m[2].trim(), qty: m[1] + "X" };
+    return { rest: t, qty: "" };
+  }
+
+  function attachQuantity(parsed, qty) {
+    if (qty) {
+      parsed.quantityNotation = qty;
+    }
+    return parsed;
+  }
+
+  function isDrawingMetadataValue(text) {
+    var t = String(text || "").replace(/\s+/g, " ").trim();
+    if (!t || isRejectedLabel(t)) return false;
+    if (/^(?:drawing|part|revision|change|mass|weight|date|material|finish|title|scale|sheet)(?:\s*(?:number|no|#|date))?$/i.test(t)) {
+      return false;
+    }
+    if (/^\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4}$/.test(t)) return true;
+    if (/^\d+[.,]?\d*\s*(?:kg|g|lb|lbs)?$/i.test(t)) return true;
+    if (/^[A-Z]$/.test(t)) return true;
+    if (/^[A-Za-z0-9][A-Za-z0-9\-_/\.]{1,48}$/.test(t)) return true;
+    return false;
+  }
+
+  function extractWeldThroat(text) {
+    var t = normalizeEuropeanDecimal(String(text || "").trim());
+    if (!t) return "";
+    var vals = t.match(/\ba\s*(\d+\.?\d*)\b/gi);
+    if (vals && vals.length) {
+      var m = vals[0].match(/\ba\s*(\d+\.?\d*)\b/i);
+      return m ? "a " + m[1] : "";
+    }
+    m = t.match(/^a(\d+\.?\d*)$/i);
+    return m ? "a " + m[1] : "";
+  }
+
   function parseDetectedText(raw) {
     const text = (raw || "").trim();
-    if (!text) return { nominal: "", tolLow: "", tolHigh: "" };
+    if (!text) return { nominal: "", tolLow: "", tolHigh: "", toleranceType: "", quantityNotation: "" };
 
-    let s = text.replace(/^[ØøΦφ]\s*/i, "").replace(/\s+/g, " ");
+    var split = extractQuantityPrefix(normalizeEuropeanDecimal(text));
+    let s = split.rest.replace(/^[ØøΦφ]\s*/i, "").replace(/\s+/g, " ");
+    var qty = split.qty;
 
-    let m = s.match(/^([+-]?\d+\.?\d*)\s*[±]\s*(\d+\.?\d*)/);
+    let m = s.match(/^=\s*(\d+\.?\d*)\s*=$/);
+    if (m) {
+      return attachQuantity(
+        { nominal: m[1], tolLow: "", tolHigh: "", toleranceType: "Metadata", featureType: "Metadata" },
+        qty
+      );
+    }
+
+    m = s.match(/^\(\s*(\d+\.?\d*)\s*\)$/);
+    if (m) return attachQuantity({ nominal: m[1], tolLow: "", tolHigh: "", toleranceType: "Reference" }, qty);
+
+    m = s.match(/^R([azt])\s*(\d+\.?\d*)$/i);
+    if (m) {
+      return attachQuantity(
+        { nominal: "R" + m[1].toLowerCase() + " " + m[2], tolLow: "", tolHigh: "", toleranceType: "Surface Finish" },
+        qty
+      );
+    }
+
+    m = normalizeEuropeanDecimal(text).match(/[ØøΦφ⌀∅]\s*(\d+\.?\d*)/i);
+    if (m) {
+      return attachQuantity({ nominal: "Ø" + m[1], tolLow: "", tolHigh: "", toleranceType: "" }, qty);
+    }
+
+    m = s.match(/^R(\d+\.?\d*)\s*-?\s*$/i);
+    if (m) {
+      return attachQuantity({ nominal: "R" + m[1], tolLow: "", tolHigh: "", toleranceType: "Radius" }, qty);
+    }
+
+    var weldNom = extractWeldThroat(split.rest) || extractWeldThroat(text);
+    if (weldNom) {
+      return attachQuantity({ nominal: weldNom, tolLow: "", tolHigh: "", toleranceType: "Weld" }, qty);
+    }
+
+    m = s.match(/^[A-Z]$/);
+    if (m) return attachQuantity({ nominal: m[0], tolLow: "", tolHigh: "", toleranceType: "Datum" }, qty);
+
+    m = s.match(/^([+-]?\d+\.?\d*)\s*[±]\s*(\d+\.?\d*)/);
     if (m) {
       const tol = parseFloat(m[2]);
-      return { nominal: m[1], tolLow: String(-tol), tolHigh: String(tol) };
+      return { nominal: m[1], tolLow: String(-tol), tolHigh: String(tol), toleranceType: "" };
+    }
+
+    m = s.match(/^([+-]?\d+\.?\d*)\s*\+(\d+\.?\d*)\s*\/\s*(\d+\.?\d*)/);
+    if (m) {
+      return { nominal: m[1], tolLow: m[3], tolHigh: m[2], toleranceType: "" };
+    }
+
+    m = s.match(/^(\d+\.?\d*)\s+\+(\d+\.?\d*)\s+(\d+\.?\d*)$/);
+    if (m) {
+      return { nominal: m[1], tolLow: m[3], tolHigh: m[2], toleranceType: "" };
     }
 
     m = s.match(/^([+-]?\d+\.?\d*)\s*([+-]\d+\.?\d*)\s*\/\s*([+-]\d+\.?\d*)/);
     if (m) {
-      return { nominal: m[1], tolLow: m[3], tolHigh: m[2].replace(/^\+/, "") };
+      return { nominal: m[1], tolLow: m[3], tolHigh: m[2].replace(/^\+/, ""), toleranceType: "" };
     }
 
     m = s.match(/^([+-]?\d+\.?\d*)\s*\+\s*(\d+\.?\d*)\s*\/\s*-?\s*(\d+\.?\d*)/);
     if (m) {
-      return { nominal: m[1], tolLow: "-" + m[3], tolHigh: m[2] };
+      return { nominal: m[1], tolLow: m[3], tolHigh: m[2], toleranceType: "" };
     }
 
     m = s.match(/^([+-]?\d+\.?\d*)\s*([+-]\d+\.?\d*)\s+([+-]\d+\.?\d*)/);
     if (m) {
-      return { nominal: m[1], tolLow: m[3], tolHigh: m[2].replace(/^\+/, "") };
+      return { nominal: m[1], tolLow: m[3], tolHigh: m[2].replace(/^\+/, ""), toleranceType: "" };
     }
 
     m = s.match(/^([+-]?\d+\.?\d*)\s*$/);
-    if (m) return { nominal: m[1], tolLow: "", tolHigh: "" };
+    if (m) return attachQuantity({ nominal: m[1], tolLow: "", tolHigh: "", toleranceType: "" }, qty);
 
     m = s.match(/([+-]?\d+\.?\d*)/);
-    if (m) return { nominal: m[1], tolLow: "", tolHigh: "" };
+    if (m) return attachQuantity({ nominal: m[1], tolLow: "", tolHigh: "", toleranceType: "" }, qty);
 
-    return { nominal: text, tolLow: "", tolHigh: "" };
+    if (isDrawingMetadataValue(s)) {
+      return attachQuantity({ nominal: s, tolLow: "", tolHigh: "", toleranceType: "Metadata" }, qty);
+    }
+
+    return attachQuantity({ nominal: text, tolLow: "", tolHigh: "", toleranceType: "" }, qty);
   }
 
   function buildDetectedText(nominal, tolerance) {
@@ -55,25 +160,38 @@
     const others = it.others != null ? String(it.others).trim() : "";
 
     if (!nom && !tol) {
-      const src = others || (it.detected_text || "").trim();
+      const src = [others, it.raw_ocr, it.detected_text]
+        .map(function (p) {
+          return normalizeEuropeanDecimal(p);
+        })
+        .filter(Boolean)
+        .join(" ")
+        .trim();
       if (src) {
         const p = parseDetectedText(src);
         nom = p.nominal || "";
+        if (p.toleranceType) it.tolerance_type = p.toleranceType;
+        if (p.toleranceType === "Surface Finish") it.feature_type = "Surface Finish";
+        if (p.quantityNotation) {
+          it.quantity_notation = p.quantityNotation;
+          it.others = p.quantityNotation;
+        }
         if (p.tolLow !== "" || p.tolHigh !== "") {
           const lo = parseFloat(p.tolLow);
           const hi = parseFloat(p.tolHigh);
           if (Number.isFinite(lo) && Number.isFinite(hi) && Math.abs(lo + hi) < 1e-6) {
             tol = "±" + String(hi).replace(/^\+/, "");
-          } else if (p.tolHigh) {
-            tol = "+" + p.tolHigh + (p.tolLow ? "/" + p.tolLow : "");
+          } else if (p.tolHigh !== "" || p.tolLow !== "") {
+            tol = "+" + String(p.tolHigh).replace(/^\+/, "") + "/" + String(p.tolLow).replace(/^\+/, "");
           }
         }
       }
     }
 
-    it.nominal_value = nom;
-    it.tolerance = tol;
+    it.nominal_value = normalizeEuropeanDecimal(nom);
+    it.tolerance = normalizeEuropeanDecimal(tol);
     it.detected_text = buildDetectedText(nom, tol);
+    applyClassAwareParseHints(it, parseDetectedText(buildDetectedText(nom, tol)));
     return it;
   }
 
@@ -85,18 +203,84 @@
     return parseDetectedText(it.detected_text || "");
   }
 
+  function isRejectedLabel(text) {
+    var t = String(text || "").replace(/\s+/g, " ").trim();
+    if (!t) return false;
+    if (/^[XxYyZz]$/.test(t)) return true;
+    if (/^SECTION\s*[A-Z0-9]*$/i.test(t)) return true;
+    if (/^DETAIL\s*[A-Z0-9]*$/i.test(t)) return true;
+    if (/^VIEW\s/i.test(t)) return true;
+    return false;
+  }
+
+  function isSymbolAlphanumericValue(text) {
+    var t = String(text || "").replace(/\s+/g, " ").trim();
+    if (!t) return false;
+    if (/^R[azt]\s*\d/i.test(t)) return true;
+    if (/^a\s+\d+\.?\d*$/i.test(t)) return true;
+    if (/^\(\s*\d+\.?\d*\s*\)$/.test(t)) return true;
+    if (/^\d+\.?\d*$/.test(t)) return true;
+    return false;
+  }
+
+  function applyClassAwareParseHints(it, parsed) {
+    if (!it) return it;
+    var cls = String(it.class_name || "").toLowerCase();
+    var nom = String(it.nominal_value || "").trim();
+    if (/surface/.test(cls) && /^a\s+\d/i.test(nom)) {
+      it.nominal_value = nom.replace(/^a\s+/i, "Ra ");
+      it.feature_type = it.feature_type || "Surface Finish";
+    }
+    if (/weld/.test(cls)) {
+      it.feature_type = it.feature_type || "Weld";
+      var weld = extractWeldThroat(balloonItemText(it));
+      if (weld) it.nominal_value = weld;
+    }
+    if (/gdt|gd/.test(cls)) {
+      it.feature_type = it.feature_type || "GD&T";
+    }
+    if (/special|characteristic/.test(cls) && /^\d+\.?\d*$/.test(nom)) {
+      it.tolerance_type = "Basic";
+    }
+    if (parsed && parsed.toleranceType) it.tolerance_type = parsed.toleranceType;
+    if (parsed && parsed.toleranceType === "Surface Finish") it.feature_type = "Surface Finish";
+    return it;
+  }
+
   /**
-   * Balloon must have at least one of: crop image, nominal value, or tolerance.
-   * Otherwise it is hidden on drawing, table, and inspection report.
+   * Valid for drawing + inspection report: must have nominal (with digit for dimensions)
+   * or readable note/GD&T/weld text. Crop image alone is not enough.
    */
   function balloonHasExtractedData(it) {
     if (!it) return false;
+    enrichBalloonItem(it);
+    var cls = String(it.class_name || "").toLowerCase();
     var nom = String(it.nominal_value != null ? it.nominal_value : "").trim();
     var tol = String(it.tolerance != null ? it.tolerance : "").trim();
-    var crop = String(it.crop_preview_base64 || it.crop_save_base64 || "").trim();
-    if (crop.length > 40) return true;
-    if (nom && nom.toLowerCase() !== "empty") return true;
-    if (tol && tol.toLowerCase() !== "empty") return true;
+    var lo = String(it.tol_low != null ? it.tol_low : "").trim();
+    var hi = String(it.tol_high != null ? it.tol_high : "").trim();
+    if (!lo && !hi && tol) {
+      var parsed = parseDetectedText(buildDetectedText(nom, tol));
+      lo = parsed.tolLow || "";
+      hi = parsed.tolHigh || "";
+    }
+    var blob = balloonItemText(it);
+    if (isRejectedLabel(nom) || isRejectedLabel(tol) || isRejectedLabel(blob)) return false;
+    if (/note|title|revision|miscellaneous/.test(cls)) {
+      if (isDrawingMetadataValue(nom) || isDrawingMetadataValue(blob)) return true;
+      return blob.length >= 1 && !isRejectedLabel(blob);
+    }
+    if (/^R\d/i.test(nom)) return true;
+    if (/^[ØøΦφ⌀∅]\s*\d/.test(nom)) return true;
+    if (/gdt|gd|datum|weld|surface|special/.test(cls)) {
+      return /[\dA-Za-z°±]/.test(nom + tol + blob);
+    }
+    if (isSymbolAlphanumericValue(nom) || isSymbolAlphanumericValue(blob)) return true;
+    if (/\bR[azt]\s*\d/i.test(nom + blob)) return true;
+    if (/\ba\s+\d/i.test(blob)) return true;
+    if (nom && /\d/.test(nom)) return true;
+    if (/[ØøΦφ⌀∅]/.test(nom) && /\d/.test(nom + tol + blob)) return true;
+    if (lo || hi) return !!(nom || /\d/.test(tol));
     return false;
   }
 
@@ -114,28 +298,65 @@
     ensureDrawingAnnotations(det);
     var items = det.balloon_items || [];
     var dets = det.detections || [];
+    var full = det.detections_full || [];
     var anns = det.drawing_annotations || [];
-    var kept = [];
-    var keptDi = {};
+    var byDi = {};
     var i;
+
+    for (i = 0; i < items.length; i++) {
+      enrichBalloonItem(items[i]);
+      var di = detectionIndexForItem(det, items[i]);
+      if (di == null) continue;
+      if (!byDi[di]) byDi[di] = [];
+      byDi[di].push(items[i]);
+    }
+
+    var keep = [];
+    var dropped = 0;
+    for (i = 0; i < dets.length; i++) {
+      var group = byDi[i] || [];
+      var ok = group.some(balloonHasExtractedData);
+      if (ok) keep.push(i);
+      else dropped += 1;
+    }
+
+    if (keep.length === dets.length) {
+      det.balloons_dropped_report = dropped;
+      return det;
+    }
+
+    var remap = {};
+    keep.forEach(function (oldIdx, newIdx) {
+      remap[oldIdx] = newIdx;
+    });
+
+    det.detections = keep.map(function (idx) {
+      return dets[idx];
+    });
+    if (full.length === dets.length) {
+      det.detections_full = keep.map(function (idx) {
+        return full[idx];
+      });
+    }
+    det.drawing_annotations = keep.map(function (idx, newIdx) {
+      var ann = anns[idx] || {};
+      return Object.assign({}, ann, { id: newIdx + 1, canvas_skip: false });
+    });
+
+    var newItems = [];
     for (i = 0; i < items.length; i++) {
       if (!balloonHasExtractedData(items[i])) continue;
-      kept.push(items[i]);
-      var di = detectionIndexForItem(det, items[i]);
-      if (di != null) keptDi[di] = true;
+      var oldDi = detectionIndexForItem(det, items[i]);
+      if (oldDi == null || remap[oldDi] === undefined) continue;
+      var row = Object.assign({}, enrichBalloonItem(items[i]));
+      row.detection_index = remap[oldDi];
+      row.balloon_number = remap[oldDi] + 1;
+      newItems.push(row);
     }
-    det.balloon_items = kept;
-    var hidden = 0;
-    for (i = 0; i < dets.length; i++) {
-      if (!keptDi[i]) {
-        hidden += 1;
-        if (i < anns.length) {
-          anns[i] = Object.assign({}, anns[i], { canvas_skip: true });
-        }
-      }
-    }
-    det.drawing_annotations = anns;
-    det.balloons_hidden_no_data = hidden;
+    det.balloon_items = newItems;
+    det.count = det.detections.length;
+    det.balloons_dropped_report = dropped;
+    det.balloons_hidden_no_data = dropped;
     return det;
   }
 
@@ -160,7 +381,12 @@
   function parseMultiplierCount(text) {
     const blob = (text || "").trim();
     if (!blob) return 0;
-    const m = blob.match(/(\d+)\s*[xX×]/);
+    let m = blob.match(/\(\s*(\d+)\s*[xX×]\s*\)/);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      return Number.isFinite(n) && n >= 2 ? n : 0;
+    }
+    m = blob.match(/(\d+)\s*[xX×]/);
     if (!m) return 0;
     const n = parseInt(m[1], 10);
     return Number.isFinite(n) && n >= 2 ? n : 0;
@@ -204,7 +430,7 @@
     return dot > 0 ? bn.slice(0, dot) : bn;
   }
 
-  /** Whole number for red circle on drawing only (15 not 15.1). Table keeps sub-rows. */
+  /** Whole number for canvas balloon label only (15 not 15.1). Table keeps sub-rows. */
   /**
    * Tight balloon: place circle just outside the detection box with a clear leader target.
    * Returns image-space { ax, ay, px, py } (anchor on box edge, preferred balloon center).
@@ -915,9 +1141,12 @@
       existing = InspectionStore.getMeta() || {};
     }
     const meta = {
+      drawingNumber: tb.drawing_number || tb.drawingNumber || existing.drawingNumber || "",
       partNumber: tb.part_number || tb.partNumber || existing.partNumber || "",
       partName: tb.part_name || tb.partName || existing.partName || "",
       revision: tb.revision || existing.revision || "",
+      changeNumber: tb.change_number || tb.changeNumber || existing.changeNumber || "",
+      date: tb.date || existing.date || "",
       material: tb.material || existing.material || "",
       mass: tb.mass || existing.mass || "",
       finish: tb.finish_treatment || tb.finish || existing.finish || "",

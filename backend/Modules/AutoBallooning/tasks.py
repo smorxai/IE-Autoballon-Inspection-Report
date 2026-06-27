@@ -2542,53 +2542,86 @@ def mergeAnnotations(annotations_list, dimensions_data):
     return merged_annotations
 
 
-def PdfToPreprocessedImage(pdf_path, output_dir, page_num=0, dpi=500, max_pixels=178000000):
-    # Open PDF and get the specified page
+def _balloon_render_limits() -> tuple[int, int, int]:
+    """(max_pixels, max_long_side_px, target_dpi). Keeps peak RAM under ~500 MB."""
+    try:
+        max_pixels = int(os.environ.get("BALLOON_MAX_RENDER_PIXELS", "50000000"))
+    except ValueError:
+        max_pixels = 50_000_000
+    try:
+        max_long_side = int(os.environ.get("BALLOON_MAX_RENDER_LONG_SIDE", "10000"))
+    except ValueError:
+        max_long_side = 10_000
+    try:
+        dpi = int(os.environ.get("BALLOON_RENDER_DPI", "600"))
+    except ValueError:
+        dpi = 600
+    return max_pixels, max_long_side, dpi
+
+
+def PdfToPreprocessedImage(pdf_path, output_dir, page_num=0, dpi=None, max_pixels=None):
+    max_px, max_long_side, default_dpi = _balloon_render_limits()
+    if max_pixels is None:
+        max_pixels = max_px
+    if dpi is None:
+        dpi = default_dpi
+
     doc = fitz.open(pdf_path)
     page = doc[page_num]
-    
-    # Calculate zoom factor from DPI
+
     zoom = dpi / 72.0
-    
-    # Get page dimensions and calculate resulting pixels
     page_rect = page.rect
     page_width, page_height = page_rect.width, page_rect.height
     estimated_pixels = int(page_width * zoom) * int(page_height * zoom)
-    
-    # If image exceeds maximum pixel limit, reduce DPI
+
     if estimated_pixels > max_pixels:
         safe_zoom = (max_pixels / (page_width * page_height)) ** 0.5
         zoom = min(zoom, safe_zoom)
-    
-    # Convert page to image
+
+    long_pt = max(page_width, page_height)
+    if long_pt * zoom > max_long_side:
+        zoom = min(zoom, max_long_side / long_pt)
+
+    effective_dpi = round(zoom * 72.0)
+    if effective_dpi < dpi:
+        Logger.info(
+            "PdfToPreprocessedImage: capped render from %s to ~%s DPI (%sx%s px, max_pixels=%s)",
+            dpi,
+            effective_dpi,
+            int(page_width * zoom),
+            int(page_height * zoom),
+            max_pixels,
+        )
+
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-    img_data = pix.tobytes("png")
-    # Convert to PIL Image
-    pil_img = Image.open(io.BytesIO(img_data))
-    # Convert PIL to numpy array for OpenCV processing
-    img_array = np.array(pil_img)
-    # Convert to grayscale
-    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-    # Apply binary threshold to make image darker
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    # Invert so lines become white for dilation
-    inv = cv2.bitwise_not(binary)
-    # Dilate to thicken lines
-    kernel = np.ones((3,3), np.uint8)
-    thick = cv2.dilate(inv, kernel, iterations=2)
-    # Invert back to get black lines on white background
-    final_gray = cv2.bitwise_not(thick)
-    # Convert back to PIL Image
-    pil_img = Image.fromarray(final_gray)
-    img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    # Close PDF
     doc.close()
-    # Save image
+
+    channels = pix.n
+    samples = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, channels)
+    del pix
+    if channels >= 3:
+        gray = cv2.cvtColor(samples[:, :, :3], cv2.COLOR_RGB2GRAY)
+    else:
+        gray = samples[:, :, 0].copy()
+    del samples
+
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    del gray
+    inv = cv2.bitwise_not(binary)
+    del binary
+    kernel = np.ones((3, 3), np.uint8)
+    thick = cv2.dilate(inv, kernel, iterations=2)
+    del inv
+    final_gray = cv2.bitwise_not(thick)
+    del thick
+    gc.collect()
+
     os.makedirs(output_dir, exist_ok=True)
     pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
     output_filename = f"{pdf_name}_page_{page_num}.png"
     output_path = os.path.join(output_dir, output_filename)
-    pil_img.save(output_path)
+    Image.fromarray(final_gray, mode="L").save(output_path)
+    img = cv2.cvtColor(final_gray, cv2.COLOR_GRAY2BGR)
     return img, output_path
 
 
@@ -2625,32 +2658,59 @@ def run_drawing_yolo_detection(
 
         h, w = img.shape[:2]
         long_side = max(w, h)
-        infer_imgsz, infer_conf = yolo_autoballoon_inference_params(long_side, is_pdf)
-        pad = max(5, min(18, int(long_side * 0.003)))
-        web_class_conf = yolo_web_class_conf_thresholds()
-        preds = RunInference(
-            None,
-            infer_path,
-            imgsz=infer_imgsz,
-            conf_thres=infer_conf,
-            CustomNms_threshold=0.82,
-            bbox_padding=pad,
-            class_conf_thres=web_class_conf,
-            apply_legacy_merges=False,
-        )
 
-        out = []
-        for d in preds:
-            bb = d.get("bbox")
-            if not bb or len(bb) < 4:
-                continue
-            out.append(
-                {
-                    "class_name": d.get("class_name"),
-                    "confidence": d.get("conf"),
-                    "bbox": [int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3])],
-                }
+        drawing_analysis: dict = {}
+        preprocess_meta: dict = {}
+        detection_meta: dict = {}
+        try:
+            from drawing_pipeline.analysis import analyze_drawing_input
+            from drawing_pipeline.preprocess import adaptive_preprocess_drawing
+            from drawing_pipeline.detection import adaptive_yolo_detect
+            import Modules.AutoBallooning.tasks as tasks_mod
+
+            render_dpi = 600.0
+            try:
+                render_dpi = float(os.environ.get("BALLOON_RENDER_DPI", "600"))
+            except ValueError:
+                pass
+            drawing_analysis = analyze_drawing_input(
+                file_path, image_bgr=img, dpi=render_dpi, page_num=0
             )
+            img, preprocess_meta = adaptive_preprocess_drawing(img)
+            cv2.imwrite(infer_path, img)
+            h, w = img.shape[:2]
+            long_side = max(w, h)
+            out, detection_meta = adaptive_yolo_detect(tasks_mod, img, drawing_analysis, is_pdf)
+        except Exception as pipe_exc:
+            Logger.warning("Drawing pipeline fallback to single YOLO: %s", pipe_exc)
+            infer_imgsz, infer_conf = yolo_autoballoon_inference_params(long_side, is_pdf)
+            pad = max(5, min(18, int(long_side * 0.003)))
+            web_class_conf = yolo_web_class_conf_thresholds()
+            preds = RunInference(
+                None,
+                infer_path,
+                imgsz=infer_imgsz,
+                conf_thres=infer_conf,
+                CustomNms_threshold=0.82,
+                bbox_padding=pad,
+                class_conf_thres=web_class_conf,
+                apply_legacy_merges=False,
+            )
+            out = []
+            for d in preds:
+                bb = d.get("bbox")
+                if not bb or len(bb) < 4:
+                    continue
+                out.append(
+                    {
+                        "class_name": d.get("class_name"),
+                        "confidence": d.get("conf"),
+                        "bbox": [int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3])],
+                        "source": "yolo",
+                    }
+                )
+            drawing_analysis = {"detection_strategy": "yolo_full_fallback"}
+            detection_meta = {"strategy": "fallback"}
 
         preview_b64 = None
         disp_w, disp_h = w, h
@@ -2703,6 +2763,9 @@ def run_drawing_yolo_detection(
                 "input_kind": kind,
                 "preview_image_base64": preview_b64,
                 "yolo_raw_count": len(out),
+                "drawing_analysis": drawing_analysis,
+                "preprocess_meta": preprocess_meta,
+                "detection_meta": detection_meta,
             },
             None,
         )

@@ -1,0 +1,14 @@
+# Optional OCR engines for scanned (non-vector) drawings.
+# NOT installed by default — these are large and only needed if you set
+# BALLOON_OCR_ENGINE=paddle  or  BALLOON_OCR_ENGINE=google
+#
+# Install locally with:  pip install -r requirements-ocr.txt
+#
+# Vector/CAD PDFs do NOT need these — text is read directly from the PDF.
+
+# ── PaddleOCR (local, GPU optional, good on scanned engineering text) ──
+paddleocr>=2.7.0
+paddlepaddle>=2.6.0
+
+# ── Google Cloud Vision (cloud API; set GOOGLE_APPLICATION_CREDENTIALS) ──
+google-cloud-vision>=3.4.0

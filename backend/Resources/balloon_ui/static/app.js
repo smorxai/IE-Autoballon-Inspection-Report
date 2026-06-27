@@ -209,6 +209,11 @@
 
   let lastFile = null;
   let lastJson = null;
+  // ── Multi-file upload state ──────────────────────────────────────────────
+  const fileSelect = document.getElementById("fileSelect");
+  let multiFiles = [];     // selected File objects
+  let multiResults = [];   // parallel array of detection responses (or null)
+  let currentFileIdx = 0;
   let lastBalloonCanvas = null;
   let balloonImageCache = null;
   /** Blob URL for PDF iframe preview — revoked when replaced or reset */
@@ -662,8 +667,22 @@
         break;
       }
     }
-    if (idx < 0 || idx >= items.length) return;
-    const it = items[idx];
+    if (idx < 0) return;
+    // balloon_items is NOT parallel to detections — find the row that belongs
+    // to this detection (by detection_index, falling back to bbox match).
+    let it =
+      window.BalloonParse && BalloonParse.findItemForDetectionIndex
+        ? BalloonParse.findItemForDetectionIndex(det, idx)
+        : null;
+    if (!it) {
+      for (let j = 0; j < items.length; j++) {
+        if (bboxesRoughlyEqual(items[j].bbox_pixels, bboxRef)) {
+          it = items[j];
+          break;
+        }
+      }
+    }
+    if (!it) return;
     const imgData = it.crop_save_base64 || it.crop_preview_base64;
     if (!imgData) return;
     setStatus("Extracting text from manual crop…");
@@ -730,6 +749,8 @@
     const items = det.balloon_items || [];
     items.push({
       balloon_number: annId,
+      // Required: renumbering + table edits map rows to detections via detection_index.
+      detection_index: dets.length - 1,
       class_name: "Manual",
       confidence: 1,
       nominal_value: "",
@@ -1023,7 +1044,107 @@
     quickPanelSavedPos = null;
     setQuickPanelOpen(false);
     clearDeleteUndoStack();
+    multiFiles = [];
+    multiResults = [];
+    currentFileIdx = 0;
+    if (fileSelect) { fileSelect.innerHTML = ""; fileSelect.hidden = true; }
     setStatus("");
+  }
+
+  // ── Multi-file helpers ─────────────────────────────────────────────────
+  function rebuildFileSelect() {
+    if (!fileSelect) return;
+    if (!multiFiles.length || multiFiles.length === 1) {
+      fileSelect.innerHTML = "";
+      fileSelect.hidden = true;
+      return;
+    }
+    fileSelect.innerHTML = "";
+    multiFiles.forEach(function (f, i) {
+      var opt = document.createElement("option");
+      opt.value = String(i);
+      opt.textContent = (i + 1) + ". " + f.name + (multiResults[i] ? " \u2713" : "");
+      fileSelect.appendChild(opt);
+    });
+    fileSelect.value = String(currentFileIdx);
+    fileSelect.hidden = false;
+  }
+
+  function saveCurrentResult() {
+    if (currentFileIdx >= 0 && currentFileIdx < multiResults.length && lastJson) {
+      multiResults[currentFileIdx] = lastJson;
+    }
+  }
+
+  // View-only reset (keeps multi-file arrays + lastFile); used when switching files.
+  function softResetView() {
+    lastJson = null;
+    lastBalloonCanvas = null;
+    balloonImageCache = null;
+    balloonUiOverrides = {};
+    balloonMode = null;
+    pendingRectOverlay = null;
+    detachBalloonDragListeners();
+    activeBalloonDrag = null;
+    setBalloonModeButtons();
+    setBalloonToolsEnabled(false);
+    setBalloonDownloadEnabled(false);
+    setExcelDownloadEnabled(false);
+    setInspectionReportEnabled(false);
+    if (resultBody) resultBody.innerHTML = "<tr><td colspan=\"5\">Run the application to see extracted values.</td></tr>";
+    clearPanel(panelBalloon, "Run auto ballooning to see balloons here.");
+    clearDeleteUndoStack();
+  }
+
+  function loadFileResult(idx) {
+    if (idx < 0 || idx >= multiFiles.length) return;
+    currentFileIdx = idx;
+    lastFile = multiFiles[idx];
+    softResetView();
+    showInputPreview(lastFile);
+    var data = multiResults[idx];
+    if (data) {
+      lastJson = data;
+      if (jsonOut) jsonOut.textContent = JSON.stringify(data, null, 2);
+      clearDeleteUndoStack();
+      enrichDetectionItems(data.detection);
+      if (window.BalloonParse && BalloonParse.saveInspectionMetaFromDetection) {
+        BalloonParse.saveInspectionMetaFromDetection(data.detection);
+      }
+      applyBalloonNumberingPipeline();
+      renderResults(lastJson);
+      renderResultTable(lastJson);
+      setExcelDownloadEnabled(true);
+      refreshInspectionReportButton();
+      var visN = visibleBalloonTotal(data.detection || {});
+      setStatus(
+        (multiFiles.length > 1 ? "File " + (idx + 1) + "/" + multiFiles.length + " — " : "Done — ") +
+          visN + " balloon" + (visN === 1 ? "" : "s") + "."
+      );
+    } else {
+      lastJson = null;
+      setStatus(
+        "File " + (idx + 1) + "/" + multiFiles.length + " — not processed yet. Click Run auto ballooning."
+      );
+    }
+    if (fileSelect) fileSelect.value = String(idx);
+  }
+
+  async function detectOneFile(file) {
+    const fd = new FormData();
+    fd.append("file", file);
+    const headers = {};
+    const tok = getAuthToken();
+    if (tok) headers["Authorization"] = "Bearer " + tok;
+    const r = await fetch(ORIGIN + "/api/v1/detect", Object.assign({
+      method: "POST",
+      headers: headers,
+      body: fd,
+    }, cred));
+    const text = await r.text();
+    let data;
+    try { data = JSON.parse(text); } catch (e) { data = null; }
+    return { r: r, data: data, text: text };
   }
 
   function authRedirect(status, data) {
@@ -1167,7 +1288,7 @@
     }
     if (!items.length) {
       resultBody.innerHTML =
-        "<tr><td colspan=\"5\">Run auto ballooning — each red balloon on the drawing appears here (not internal detections).</td></tr>";
+        "<tr><td colspan=\"5\">Run auto ballooning — each numbered balloon on the drawing appears here (not internal detections).</td></tr>";
       return;
     }
     resultBody.innerHTML = "";
@@ -1475,7 +1596,8 @@
     const CSS_DPI = 96;
     const pxPerMm = CSS_DPI / 25.4;
     const r = (BALLOON_DIAMETER_MM * pxPerMm) / 2;
-    const balloonRed = "#e60000";
+    const balloonColor = "#CC5500";
+    const balloonFill = "#FFFFFF";
     const placed = [];
     const w = ctx.canvas.width;
     const h = ctx.canvas.height;
@@ -1629,14 +1751,65 @@
       return best;
     }
 
+    function targetAnchor(ann, x1, y1, x2, y2, dimEntry) {
+      var bb = [x1 / scale, y1 / scale, x2 / scale, y2 / scale];
+      var gap = Math.max(14, r * 2);
+      if (window.BalloonParse && BalloonParse.tightBalloonPlacement) {
+        var pl = BalloonParse.tightBalloonPlacement(
+          bb,
+          gap / scale,
+          dimEntry && dimEntry.dimension_orientation,
+          dimEntry && dimEntry.balloon_side
+        );
+        return { ax: pl.ax * scale, ay: pl.ay * scale };
+      }
+      return { ax: (x1 + x2) / 2, ay: (y1 + y2) / 2 };
+    }
+
+    function drawBalloonPointer(cx, cy, ax, ay) {
+      var dx = ax - cx;
+      var dy = ay - cy;
+      var dist = Math.hypot(dx, dy);
+      if (dist < r * 0.45) return;
+      var ux = dx / dist;
+      var uy = dy / dist;
+      var baseCx = cx + ux * r;
+      var baseCy = cy + uy * r;
+      var perpX = -uy;
+      var perpY = ux;
+      var halfW = r * 0.52;
+      ctx.beginPath();
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(baseCx + perpX * halfW, baseCy + perpY * halfW);
+      ctx.lineTo(baseCx - perpX * halfW, baseCy - perpY * halfW);
+      ctx.closePath();
+      ctx.fillStyle = balloonColor;
+      ctx.fill();
+      ctx.strokeStyle = balloonColor;
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+    }
+
     function drawBalloonLabel(cx, cy, label) {
       var fontPx = Math.max(10, Math.min(13, Math.round(r * 0.82)));
       if (String(label).length > 2) fontPx = Math.max(9, fontPx - 1);
-      ctx.font = fontPx + "px Arial, Segoe UI, system-ui, sans-serif";
+      ctx.font = "600 " + fontPx + "px Arial, Segoe UI, system-ui, sans-serif";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      ctx.fillStyle = balloonRed;
+      ctx.fillStyle = balloonColor;
       ctx.fillText(label, cx, cy);
+    }
+
+    function drawBalloonSymbol(cx, cy, ax, ay, label) {
+      drawBalloonPointer(cx, cy, ax, ay);
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.fillStyle = balloonFill;
+      ctx.fill();
+      ctx.strokeStyle = balloonColor;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      drawBalloonLabel(cx, cy, label);
     }
 
     function entryReadingOrderKey(entry) {
@@ -1661,6 +1834,7 @@
       var label = String(entry.label != null && entry.label !== "" ? entry.label : "");
       if (!label) label = String((entry.detectionIndex != null ? entry.detectionIndex : 0) + 1);
       const ann = entry.ann || {};
+      const anchor = targetAnchor(ann, x1, y1, x2, y2, entry);
       const o =
         overrides[label] ||
         overrides[ann.id] ||
@@ -1690,15 +1864,8 @@
       }
 
       ctx.save();
-
-      ctx.beginPath();
-      ctx.arc(cx, cy, r, 0, Math.PI * 2);
-      ctx.strokeStyle = balloonRed;
-      ctx.lineWidth = 1.5;
       ctx.setLineDash([]);
-      ctx.stroke();
-
-      drawBalloonLabel(cx, cy, label);
+      drawBalloonSymbol(cx, cy, anchor.ax, anchor.ay, label);
       ctx.restore();
       placed.push({ cx: cx, cy: cy });
       const hitR = Math.max(22, r * 2.4);
@@ -2097,10 +2264,27 @@
 
   if (fileInput) {
     fileInput.addEventListener("change", function () {
-      const newFile = fileInput.files && fileInput.files[0];
+      const files = fileInput.files ? Array.prototype.slice.call(fileInput.files) : [];
       resetSession();
-      lastFile = newFile;
-      showInputPreview(newFile);
+      if (!files.length) return;
+      multiFiles = files;
+      multiResults = files.map(function () { return null; });
+      currentFileIdx = 0;
+      lastFile = files[0];
+      rebuildFileSelect();
+      showInputPreview(lastFile);
+      if (files.length > 1) {
+        setStatus(files.length + " files selected. Click Run auto ballooning to process all.");
+      }
+    });
+  }
+
+  if (fileSelect) {
+    fileSelect.addEventListener("change", function () {
+      saveCurrentResult();
+      var idx = parseInt(fileSelect.value, 10);
+      if (isNaN(idx)) idx = 0;
+      loadFileResult(idx);
     });
   }
 
@@ -2164,7 +2348,7 @@
     btnModeEdit.addEventListener("click", function () {
       balloonMode = balloonMode === "edit" ? null : "edit";
       setBalloonModeButtons();
-      setModeHint(balloonMode === "edit" ? "Edit: drag red balloon circles to move them (works even if the cursor leaves the image)." : "");
+      setModeHint(balloonMode === "edit" ? "Edit: drag orange balloon markers to move them (works even if the cursor leaves the image)." : "");
       paintBalloonCanvas();
     });
   }
@@ -2201,69 +2385,78 @@
       window.location.href = "/login";
       return;
     }
-    if (!lastFile) {
+    if (!multiFiles.length && lastFile) {
+      multiFiles = [lastFile];
+      multiResults = [null];
+      currentFileIdx = 0;
+    }
+    if (!multiFiles.length) {
       setStatus("Choose a file first.");
       return;
     }
     runBtn.disabled = true;
-    setStatus("Processing…");
     if (jsonOut) jsonOut.textContent = "…";
 
+    const total = multiFiles.length;
+    let processed = 0;
+    let failed = 0;
     try {
-      const fd = new FormData();
-      fd.append("file", lastFile);
-      const _detectHeaders = {};
-      const _detectToken = getAuthToken();
-      if (_detectToken) _detectHeaders["Authorization"] = "Bearer " + _detectToken;
-      const r = await fetch(ORIGIN + "/api/v1/detect", Object.assign({
-        method: "POST",
-        headers: _detectHeaders,
-        body: fd,
-      }, cred));
-      const text = await r.text();
-      let data;
-      try {
-        data = JSON.parse(text);
-      } catch (e) {
-        data = null;
-      }
-      if (authRedirect(r.status, data)) return;
-      if (!data) {
-        if (r.status === 502 || r.status === 504) {
-          setStatus(
-            "Server timed out (HTTP " +
-              r.status +
-              "). On Render use Render safe mode or upgrade instance RAM. Try a smaller PDF/image."
-          );
-        } else {
-          setStatus("Non-JSON response HTTP " + r.status);
+      for (let i = 0; i < multiFiles.length; i++) {
+        if (multiResults[i]) continue; // already processed
+        const f = multiFiles[i];
+        setStatus(
+          (total > 1 ? "Processing " + (i + 1) + "/" + total + ": " : "Processing ") + f.name + " …"
+        );
+        let res;
+        try {
+          res = await detectOneFile(f);
+        } catch (e) {
+          failed++;
+          setStatus("Request failed on " + f.name + ": " + e);
+          continue;
         }
-        if (jsonOut) jsonOut.textContent = text.slice(0, 4000);
-        return;
+        if (authRedirect(res.r.status, res.data)) return;
+        if (!res.data) {
+          failed++;
+          if (res.r.status === 502 || res.r.status === 504) {
+            setStatus(
+              "Server timed out (HTTP " + res.r.status + ") on " + f.name +
+                ". On Render use safe mode / upgrade RAM, or try a smaller file."
+            );
+          } else {
+            setStatus("Non-JSON response HTTP " + res.r.status + " on " + f.name);
+          }
+          continue;
+        }
+        if (!res.r.ok || !res.data.ok) {
+          failed++;
+          var errMsg = res.data.error || res.data.detail || "HTTP " + res.r.status;
+          if (typeof errMsg === "object") errMsg = JSON.stringify(errMsg);
+          setStatus("Error on " + f.name + ": " + errMsg);
+          continue;
+        }
+        multiResults[i] = res.data;
+        processed++;
+        rebuildFileSelect();
       }
-      if (jsonOut) jsonOut.textContent = JSON.stringify(data, null, 2);
-      if (!r.ok || !data.ok) {
-        var errMsg = data.error || data.detail || "HTTP " + r.status;
-        if (typeof errMsg === "object") errMsg = JSON.stringify(errMsg);
-        setStatus("Error: " + errMsg);
-        return;
+
+      // Show the first successfully processed file (or the current one).
+      let showIdx = currentFileIdx;
+      if (!multiResults[showIdx]) {
+        showIdx = multiResults.findIndex(function (d) { return !!d; });
+        if (showIdx < 0) showIdx = currentFileIdx;
       }
-      lastJson = data;
-      clearDeleteUndoStack();
-      enrichDetectionItems(data.detection);
-      if (window.BalloonParse && BalloonParse.saveInspectionMetaFromDetection) {
-        BalloonParse.saveInspectionMetaFromDetection(data.detection);
+      if (multiResults[showIdx]) {
+        loadFileResult(showIdx);
       }
-    applyBalloonNumberingPipeline();
-    renderResults(lastJson);
-    renderResultTable(lastJson);
-      setExcelDownloadEnabled(true);
-      refreshInspectionReportButton();
-      var detDone = data.detection || {};
-      var visibleN = visibleBalloonTotal(detDone);
-      setStatus(
-        "Done — " + visibleN + " balloon" + (visibleN === 1 ? "" : "s") + "."
-      );
+      if (total > 1) {
+        var ok = multiResults.filter(function (d) { return !!d; }).length;
+        setStatus(
+          "Processed " + ok + "/" + total + " file" + (total === 1 ? "" : "s") +
+            (failed ? " (" + failed + " failed)" : "") +
+            ". Use the file selector to switch between results."
+        );
+      }
     } catch (e) {
       setStatus("Request failed: " + e);
       if (jsonOut) jsonOut.textContent = String(e);
