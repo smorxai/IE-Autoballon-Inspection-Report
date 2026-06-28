@@ -73,8 +73,7 @@
       window.location.href = "/change-password";
       return;
     }
-    if (res.data.role === "super_admin") window.location.href = "/admin";
-    else window.location.href = "/dashboard";
+    window.location.href = "/dashboard";
   });
 
   document.getElementById("password").addEventListener("keydown", function (e) {
