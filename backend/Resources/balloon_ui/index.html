@@ -1,17 +1,17 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <title>Inspection Report Software</title>
-  <link rel="stylesheet" href="/assets/style.css?v=30" />
+  <link rel="stylesheet" href="/assets/style.css?v=31" />
 </head>
 <body class="auth-pending">
   <style>
     body.auth-pending { visibility: hidden; }
     body.auth-pending::before {
-      content: "Checking login…";
+      content: "Checking loginâ€¦";
       visibility: visible;
       display: block;
       text-align: center;
@@ -62,14 +62,14 @@
   <div class="steps">
     <section class="step">
       <div class="step-head">
-        <h2>1 · Input file</h2>
+        <h2>1 Â· Input file</h2>
         <button type="button" id="downloadInput" class="btn-secondary" disabled>Download</button>
       </div>
       <div id="panelInput" class="panel"><p class="placeholder">No file yet.</p></div>
     </section>
     <section class="step">
       <div class="step-head step-head-wide">
-        <h2>2 · Auto Ballooning</h2>
+        <h2>2 Â· Auto Ballooning</h2>
         <div class="balloon-modes" aria-label="Balloon tools">
           <button type="button" id="btnModeCreate" class="btn-secondary mode-btn" disabled title="Draw a rectangle on the drawing to add a manual detection and balloon">Create</button>
           <button type="button" id="btnModeEdit" class="btn-secondary mode-btn" disabled title="Drag balloon circles to reposition">Edit</button>
@@ -77,13 +77,13 @@
           <button type="button" id="btnUndoDelete" class="btn-secondary mode-btn btn-undo-delete" hidden title="Restore deleted balloons (newest first; multiple undo steps)">Undo delete</button>
           <button type="button" id="btnModeSave" class="btn-secondary mode-btn mode-save" disabled title="Save balloon positions and manual regions to JSON and table">Save</button>
           <div class="balloon-menu-wrap">
-            <button type="button" id="btnBalloonMenu" class="btn-secondary btn-icon" disabled title="Quick table — edit balloons, then save to sync below" aria-expanded="false" aria-controls="balloonQuickPanel">⋮</button>
+            <button type="button" id="btnBalloonMenu" class="btn-secondary btn-icon" disabled title="Quick table â€” edit balloons, then save to sync below" aria-expanded="false" aria-controls="balloonQuickPanel">â‹®</button>
             <div id="balloonQuickPanel" class="balloon-quick-panel" hidden>
               <div class="balloon-quick-panel-head" title="Drag to move this window">
                 <strong>Quick edit</strong>
-                <button type="button" id="btnCloseQuickPanel" class="btn-close-quick" aria-label="Close">×</button>
+                <button type="button" id="btnCloseQuickPanel" class="btn-close-quick" aria-label="Close">Ã—</button>
               </div>
-              <p class="balloon-quick-hint">Drag the title bar to move. Edit rows, then <strong>Save to main table</strong> — values sync to Details below.</p>
+              <p class="balloon-quick-hint">Drag the title bar to move. Edit rows, then <strong>Save to main table</strong> â€” values sync to Details below.</p>
               <div class="balloon-quick-table-wrap">
                 <table class="quick-balloon-table" id="quickBalloonTable">
                   <thead>
@@ -140,7 +140,7 @@
     <div class="quick-crop-modal-dialog">
       <div class="quick-crop-modal-head">
         <span>Bounding box crop</span>
-        <button type="button" class="btn-close-quick" id="btnCloseCropModal" aria-label="Close">×</button>
+        <button type="button" class="btn-close-quick" id="btnCloseCropModal" aria-label="Close">Ã—</button>
       </div>
       <div class="quick-crop-modal-body">
         <img id="quickCropViewImg" alt="Balloon crop preview" />
