@@ -147,7 +147,7 @@
         InspectionStore.setBalloonAppUrl(window.location.origin + "/app");
       }
       if (InspectionStore.setDashboardUrl) {
-        InspectionStore.setDashboardUrl("http://localhost:3000/dashboard");
+        InspectionStore.setDashboardUrl(window.location.origin + "/dashboard");
       }
     }
     var payloadOut =
@@ -1244,16 +1244,9 @@
         showToast("No data to save — redirecting to dashboard", "info");
       }
 
-      if (window.InspectionStore && InspectionStore.setDashboardUrl) {
-        InspectionStore.setDashboardUrl("http://localhost:3000/dashboard");
-      }
       resetSession();
       setTimeout(function () {
-        var dash =
-          window.InspectionStore && InspectionStore.getDashboardUrl
-            ? InspectionStore.getDashboardUrl()
-            : "http://localhost:3000/dashboard";
-        window.location.href = dash;
+        window.location.href = "/dashboard";
       }, 800);
     });
   }

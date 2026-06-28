@@ -36,8 +36,7 @@
   }).then(function (me) {
     if (!me) return;
     if (me.is_temp_password) { window.location.href = "/change-password"; return; }
-    if (me.role === "super_admin") window.location.href = "/admin";
-    else window.location.href = "/app";
+    window.location.href = "/dashboard";
   }).catch(function () {});
 
   document.getElementById("btnLogin").addEventListener("click", async function () {
@@ -75,7 +74,7 @@
       return;
     }
     if (res.data.role === "super_admin") window.location.href = "/admin";
-    else window.location.href = "/app";
+    else window.location.href = "/dashboard";
   });
 
   document.getElementById("password").addEventListener("keydown", function (e) {

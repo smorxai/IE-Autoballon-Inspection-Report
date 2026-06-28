@@ -4,8 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Login — Inspection Report</title>
-  <link rel="stylesheet" href="/assets/style.css?v=10" />
-  <link rel="stylesheet" href="/assets/auth.css?v=11" />
+  <link rel="stylesheet" href="/assets/style.css?v=30" />
+  <link rel="stylesheet" href="/assets/auth.css?v=20" />
 </head>
 <body class="auth-body">
   <div class="auth-card auth-card-login" id="card">
@@ -23,16 +23,19 @@
       <input type="text" id="loginId" autocomplete="username" placeholder="you@company.com or username" />
 
       <label for="password">Password</label>
-      <input type="password" id="password" autocomplete="current-password" placeholder="••••••••" />
+      <div class="password-field">
+        <input type="password" id="password" autocomplete="current-password" placeholder="••••••••" />
+        <button type="button" class="password-toggle" id="btnTogglePassword" aria-pressed="false" aria-label="Show password" title="Show password">Show</button>
+      </div>
 
       <div class="auth-actions">
         <button type="button" id="btnLogin" class="primary">Log in</button>
       </div>
-      <p class="auth-small">Accounts are created by your super admin. Contact them if you need access.</p>
+      <p class="auth-small" id="trialNote">Your super admin must grant access before you can use the app.</p>
     </div>
   </div>
 
   <script src="/assets/auth.js?v=4"></script>
-  <script src="/assets/login.js?v=14"></script>
+  <script src="/assets/login.js?v=16"></script>
 </body>
 </html>

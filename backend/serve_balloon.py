@@ -5322,6 +5322,14 @@ async def change_password_page():
     return _html_no_cache(p)
 
 
+@app.get("/dashboard")
+async def dashboard_page():
+    p = _UI_DIR / "dashboard.html"
+    if not p.is_file():
+        return RedirectResponse("/app")
+    return _html_no_cache(p)
+
+
 @app.get("/app")
 async def app_page():
     index = _UI_DIR / "index.html"

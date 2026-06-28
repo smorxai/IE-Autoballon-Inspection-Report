@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <title>Dashboard — Inspection Report</title>
+  <link rel="stylesheet" href="/assets/style.css?v=30" />
+</head>
+<body class="auth-pending">
+  <style>
+    body.auth-pending { visibility: hidden; }
+    body.auth-pending::before {
+      content: "Checking login…";
+      visibility: visible;
+      display: block;
+      text-align: center;
+      padding: 3rem;
+      color: #3f546e;
+      font-size: 0.82rem;
+      letter-spacing: 0.05em;
+    }
+
+    .dash-main {
+      max-width: 1000px;
+      margin: 0 auto;
+      padding: 2rem 0 3rem;
+    }
+    .dash-hero {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 1.75rem;
+      padding: 3.5rem 2.5rem;
+      background: #0c1422;
+      border: 1px solid #182640;
+      border-top: 3px solid #c9a84c;
+      border-radius: 4px;
+      margin-bottom: 2.5rem;
+      text-align: center;
+    }
+    .dash-welcome {
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      color: #dde4ef;
+      margin: 0;
+    }
+    .dash-hero-actions {
+      display: flex;
+      gap: 0.85rem;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+    .dash-open-btn {
+      display: inline-block;
+      padding: 0.75rem 2.25rem;
+      font-size: 0.9rem;
+      text-decoration: none;
+      border-radius: 3px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      background: #1a3d7a;
+      color: #dde4ef;
+      border: 1px solid #3162b8;
+      transition: background 0.12s, border-color 0.12s;
+    }
+    .dash-open-btn:hover { background: #214999; border-color: #4a7fd4; }
+
+    .dash-section-title {
+      font-size: 0.68rem;
+      color: #c9a84c;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      margin: 0 0 1rem;
+      font-weight: 700;
+      padding-bottom: 0.4rem;
+      border-bottom: 1px solid #182640;
+    }
+    .dash-session-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 1px;
+      border: 1px solid #182640;
+      border-radius: 4px;
+      overflow: hidden;
+      background: #182640;
+    }
+    .dash-session-card {
+      background: #0c1422;
+      padding: 1rem 1.1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      transition: background 0.1s;
+    }
+    .dash-session-card:hover { background: #111d33; }
+    .dash-session-thumb {
+      width: 100%;
+      aspect-ratio: 4/3;
+      object-fit: cover;
+      border-radius: 2px;
+      background: #07090f;
+      display: block;
+      border: 1px solid #182640;
+    }
+    .dash-thumb-placeholder {
+      width: 100%;
+      aspect-ratio: 4/3;
+      background: #07090f;
+      border: 1px solid #182640;
+      border-radius: 2px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #243758;
+      font-size: 1.75rem;
+    }
+    .dash-session-name {
+      font-size: 0.82rem;
+      color: #dde4ef;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      letter-spacing: 0.01em;
+    }
+    .dash-session-meta {
+      font-size: 0.72rem;
+      color: #3f546e;
+      letter-spacing: 0.02em;
+    }
+    .dash-empty, .dash-loading {
+      color: #3f546e;
+      font-size: 0.82rem;
+      font-style: italic;
+      grid-column: 1 / -1;
+      padding: 2rem;
+      background: #0c1422;
+    }
+  </style>
+
+  <script src="/assets/auth.js?v=4"></script>
+  <script>
+  (function () {
+    if (!window.BalloonAuth) {
+      document.body.classList.remove("auth-pending");
+      return;
+    }
+    BalloonAuth.requireAppAccess().then(function (ctx) {
+      if (!ctx) return;
+      document.body.classList.remove("auth-pending");
+    }).catch(function () {
+      window.location.replace("/login");
+    });
+  })();
+  </script>
+
+  <header class="top">
+    <div class="top-left">
+      <a class="brand" href="/dashboard" aria-label="SmorX.ai home">
+        <img class="brand-logo brand-logo--full" src="/assets/smorx-logo-full.png?v=1" alt="SmorX.ai" width="400" height="164" />
+      </a>
+    </div>
+    <h1 class="top-title">Inspection Software system</h1>
+    <div class="top-right top-actions">
+      <button type="button" id="logoutBtn" class="btn-secondary">Log out</button>
+    </div>
+  </header>
+
+  <main class="dash-main">
+    <section class="dash-hero">
+      <h2 id="dashWelcome" class="dash-welcome">Welcome</h2>
+      <div class="dash-hero-actions">
+        <a href="/app" class="dash-open-btn" id="dashOpenApp">Open Autoballooning App</a>
+        <a href="/admin" class="dash-admin-btn btn-secondary" id="dashAdminLink" hidden>Admin Panel</a>
+      </div>
+    </section>
+
+    <section>
+      <h3 class="dash-section-title">Recent Sessions</h3>
+      <div class="dash-session-grid" id="dashSessionGrid">
+        <p class="dash-loading">Loading…</p>
+      </div>
+    </section>
+  </main>
+
+  <script src="/assets/dashboard.js?v=1"></script>
+</body>
+</html>
