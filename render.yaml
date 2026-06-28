@@ -1,6 +1,8 @@
 services:
+  # ── Backend — Python Web Service ─────────────────────────────────────────
+  # Render dashboard: New → Web Service → connect repo → set Root Directory = backend
   - type: web
-    name: inspection-report-api
+    name: autoballon-backend
     runtime: python
     rootDir: backend
     buildCommand: >-
@@ -12,8 +14,8 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.10.11"
-
-      # ── Safe mode (avoids HTTP 502 on Render free tier) ────────────────────
+      - key: BALLOON_USE_BUNDLED_UI
+        value: "1"
       - key: BALLOON_RENDER_SAFE
         value: "1"
       - key: BALLOON_OCR_ENGINE
@@ -21,7 +23,12 @@ services:
       - key: BALLOON_MAX_CROP_OCR
         value: "40"
 
-      # ── Required secrets — set these in the Render dashboard ───────────────
+      # Set BALLOON_CORS_ORIGINS to your frontend Render URL, e.g.:
+      # https://autoballon-frontend.onrender.com
+      - key: BALLOON_CORS_ORIGINS
+        sync: false
+
+      # Required secrets — set in Render dashboard Environment tab
       - key: DATABASE_URL
         sync: false
       - key: ANTHROPIC_API_KEY
@@ -32,9 +39,17 @@ services:
         sync: false
       - key: SUPER_ADMIN_PASSWORD
         sync: false
-
-      # ── Optional ───────────────────────────────────────────────────────────
       - key: RAZORPAY_KEY_ID
         sync: false
       - key: RAZORPAY_KEY_SECRET
         sync: false
+
+  # ── Frontend — Static Site ────────────────────────────────────────────────
+  # Render dashboard: New → Static Site → connect repo → set Publish Directory = frontend
+  # IMPORTANT: edit frontend/_redirects and replace YOUR-BACKEND with the
+  # actual backend service URL (e.g. https://autoballon-backend.onrender.com)
+  - type: web
+    name: autoballon-frontend
+    env: static
+    buildCommand: ""
+    staticPublishPath: ./frontend

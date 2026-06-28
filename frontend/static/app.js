@@ -77,7 +77,7 @@
         InspectionStore.setBalloonAppUrl(window.location.origin + "/app");
       }
       if (InspectionStore.setDashboardUrl) {
-        InspectionStore.setDashboardUrl("http://localhost:3000/dashboard");
+        InspectionStore.setDashboardUrl(window.location.origin + "/app");
       }
     }
     if (window.InspectionStore && InspectionStore.setPayload) {
@@ -898,14 +898,14 @@
       }
 
       if (window.InspectionStore && InspectionStore.setDashboardUrl) {
-        InspectionStore.setDashboardUrl("http://localhost:3000/dashboard");
+        InspectionStore.setDashboardUrl(window.location.origin + "/app");
       }
       resetSession();
       setTimeout(function () {
         var dash =
           window.InspectionStore && InspectionStore.getDashboardUrl
             ? InspectionStore.getDashboardUrl()
-            : "http://localhost:3000/dashboard";
+            : window.location.origin + "/app";
         window.location.href = dash;
       }, 800);
     });

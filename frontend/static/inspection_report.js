@@ -496,7 +496,7 @@
       if (window.InspectionStore && InspectionStore.goToDashboard) {
         InspectionStore.goToDashboard();
       } else {
-        window.location.href = "http://localhost:3000/dashboard";
+        window.location.href = window.location.origin + "/app";
       }
     });
   }
