@@ -22,7 +22,7 @@ pandas
 pillow
 pytesseract
 matplotlib
-opencv-python
+opencv-python-headless
 PyMuPDF
 openai-whisper
 python-docx

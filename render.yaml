@@ -3,14 +3,38 @@ services:
     name: inspection-report-api
     runtime: python
     rootDir: backend
-    buildCommand: git lfs install && git lfs pull && pip install --upgrade pip && pip install -r requirements.txt
+    buildCommand: >-
+      apt-get install -y tesseract-ocr poppler-utils &&
+      git lfs install && git lfs pull &&
+      pip install --upgrade pip &&
+      pip install -r requirements.txt
     startCommand: bash start.sh
     envVars:
       - key: PYTHON_VERSION
         value: "3.10.11"
+
+      # ── Safe mode (avoids HTTP 502 on Render free tier) ────────────────────
       - key: BALLOON_RENDER_SAFE
         value: "1"
       - key: BALLOON_OCR_ENGINE
         value: tesseract
       - key: BALLOON_MAX_CROP_OCR
         value: "40"
+
+      # ── Required secrets — set these in the Render dashboard ───────────────
+      - key: DATABASE_URL
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: JWT_SECRET_KEY
+        sync: false
+      - key: SUPER_ADMIN_EMAIL
+        sync: false
+      - key: SUPER_ADMIN_PASSWORD
+        sync: false
+
+      # ── Optional ───────────────────────────────────────────────────────────
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false

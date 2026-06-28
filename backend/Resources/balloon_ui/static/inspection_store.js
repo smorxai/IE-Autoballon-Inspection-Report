@@ -147,10 +147,8 @@
 
   var DASHBOARD_URL_KEY = "smorx_dashboard_url";
   var BALLOON_APP_URL_KEY = "smorx_balloon_app_url";
-  var DEFAULT_DASHBOARD_URL = "http://localhost:3000/dashboard";
-
   function getDashboardUrl() {
-    return localStorage.getItem(DASHBOARD_URL_KEY) || DEFAULT_DASHBOARD_URL;
+    return localStorage.getItem(DASHBOARD_URL_KEY) || (window.location.origin + "/app");
   }
 
   function setDashboardUrl(url) {
