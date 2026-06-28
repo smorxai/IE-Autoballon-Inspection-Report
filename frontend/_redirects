@@ -3,10 +3,10 @@
 
 # ── API proxy to backend — replace YOUR-BACKEND with your Render service URL ─
 # Example: https://autoballon-backend.onrender.com
-/api/*         https://YOUR-BACKEND.onrender.com/api/:splat           200
-/auth/*        https://YOUR-BACKEND.onrender.com/auth/:splat          200
-/activities    https://YOUR-BACKEND.onrender.com/activities            200
-/activities/*  https://YOUR-BACKEND.onrender.com/activities/:splat    200
+/api/*         https://ie-autoballon-inspection-report.onrender.com/api/:splat           200
+/auth/*        https://ie-autoballon-inspection-report.onrender.com/auth/:splat          200
+/activities    https://ie-autoballon-inspection-report.onrender.com/activities            200
+/activities/*  https://ie-autoballon-inspection-report.onrender.com/activities/:splat    200
 
 # ── Page routes ────────────────────────────────────────────────────────────
 /              /login.html              302
