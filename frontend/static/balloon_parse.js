@@ -2,40 +2,145 @@
  * Shared parsing for balloon nominal / tolerance (Detected details + Inspection report).
  */
 (function (global) {
+  function normalizeEuropeanDecimal(s) {
+    var t = String(s || "").trim();
+    if (!t) return t;
+    var prev = null;
+    while (prev !== t) {
+      prev = t;
+      t = t.replace(/(\d),(\d{1,3})(?!\d)/g, "$1.$2");
+    }
+    return t;
+  }
+
+  function extractQuantityPrefix(s) {
+    var t = String(s || "").trim();
+    var m = t.match(/^\(\s*(\d+)\s*[xX×]\s*\)\s*(.*)$/);
+    if (m) return { rest: m[2].trim(), qty: "(" + m[1] + "X)" };
+    m = t.match(/^(\d+)\s*[xX×]\s+(.*)$/);
+    if (m && parseInt(m[1], 10) >= 2) return { rest: m[2].trim(), qty: m[1] + "X" };
+    return { rest: t, qty: "" };
+  }
+
+  function attachQuantity(parsed, qty) {
+    if (qty) {
+      parsed.quantityNotation = qty;
+    }
+    return parsed;
+  }
+
+  function isDrawingMetadataValue(text) {
+    var t = String(text || "").replace(/\s+/g, " ").trim();
+    if (!t || isRejectedLabel(t)) return false;
+    if (/^(?:drawing|part|revision|change|mass|weight|date|material|finish|title|scale|sheet)(?:\s*(?:number|no|#|date))?$/i.test(t)) {
+      return false;
+    }
+    if (/^\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4}$/.test(t)) return true;
+    if (/^\d+[.,]?\d*\s*(?:kg|g|lb|lbs)?$/i.test(t)) return true;
+    if (/^[A-Z]$/.test(t)) return true;
+    if (/^[A-Za-z0-9][A-Za-z0-9\-_/\.]{1,48}$/.test(t)) return true;
+    return false;
+  }
+
+  function extractWeldThroat(text) {
+    var t = normalizeEuropeanDecimal(String(text || "").trim());
+    if (!t) return "";
+    var vals = t.match(/\ba\s*(\d+\.?\d*)\b/gi);
+    if (vals && vals.length) {
+      var m = vals[0].match(/\ba\s*(\d+\.?\d*)\b/i);
+      return m ? "a " + m[1] : "";
+    }
+    m = t.match(/^a(\d+\.?\d*)$/i);
+    return m ? "a " + m[1] : "";
+  }
+
   function parseDetectedText(raw) {
     const text = (raw || "").trim();
-    if (!text) return { nominal: "", tolLow: "", tolHigh: "" };
+    if (!text) return { nominal: "", tolLow: "", tolHigh: "", toleranceType: "", quantityNotation: "" };
 
-    let s = text.replace(/^[ØøΦφ]\s*/i, "").replace(/\s+/g, " ");
+    var split = extractQuantityPrefix(normalizeEuropeanDecimal(text));
+    let s = split.rest.replace(/^[ØøΦφ]\s*/i, "").replace(/\s+/g, " ");
+    var qty = split.qty;
 
-    let m = s.match(/^([+-]?\d+\.?\d*)\s*[±]\s*(\d+\.?\d*)/);
+    let m = s.match(/^=\s*(\d+\.?\d*)\s*=$/);
+    if (m) {
+      return attachQuantity(
+        { nominal: m[1], tolLow: "", tolHigh: "", toleranceType: "Metadata", featureType: "Metadata" },
+        qty
+      );
+    }
+
+    m = s.match(/^\(\s*(\d+\.?\d*)\s*\)$/);
+    if (m) return attachQuantity({ nominal: m[1], tolLow: "", tolHigh: "", toleranceType: "Reference" }, qty);
+
+    m = s.match(/^R([azt])\s*(\d+\.?\d*)$/i);
+    if (m) {
+      return attachQuantity(
+        { nominal: "R" + m[1].toLowerCase() + " " + m[2], tolLow: "", tolHigh: "", toleranceType: "Surface Finish" },
+        qty
+      );
+    }
+
+    m = normalizeEuropeanDecimal(text).match(/[ØøΦφ⌀∅]\s*(\d+\.?\d*)/i);
+    if (m) {
+      return attachQuantity({ nominal: "Ø" + m[1], tolLow: "", tolHigh: "", toleranceType: "" }, qty);
+    }
+
+    m = s.match(/^R(\d+\.?\d*)\s*-?\s*$/i);
+    if (m) {
+      return attachQuantity({ nominal: "R" + m[1], tolLow: "", tolHigh: "", toleranceType: "Radius" }, qty);
+    }
+
+    var weldNom = extractWeldThroat(split.rest) || extractWeldThroat(text);
+    if (weldNom) {
+      return attachQuantity({ nominal: weldNom, tolLow: "", tolHigh: "", toleranceType: "Weld" }, qty);
+    }
+
+    m = s.match(/^[A-Z]$/);
+    if (m) return attachQuantity({ nominal: m[0], tolLow: "", tolHigh: "", toleranceType: "Datum" }, qty);
+
+    m = s.match(/^([+-]?\d+\.?\d*)\s*[±]\s*(\d+\.?\d*)/);
     if (m) {
       const tol = parseFloat(m[2]);
-      return { nominal: m[1], tolLow: String(-tol), tolHigh: String(tol) };
+      return { nominal: m[1], tolLow: String(-tol), tolHigh: String(tol), toleranceType: "" };
+    }
+
+    m = s.match(/^([+-]?\d+\.?\d*)\s*\+(\d+\.?\d*)\s*\/\s*(\d+\.?\d*)/);
+    if (m) {
+      return { nominal: m[1], tolLow: m[3], tolHigh: m[2], toleranceType: "" };
+    }
+
+    m = s.match(/^(\d+\.?\d*)\s+\+(\d+\.?\d*)\s+(\d+\.?\d*)$/);
+    if (m) {
+      return { nominal: m[1], tolLow: m[3], tolHigh: m[2], toleranceType: "" };
     }
 
     m = s.match(/^([+-]?\d+\.?\d*)\s*([+-]\d+\.?\d*)\s*\/\s*([+-]\d+\.?\d*)/);
     if (m) {
-      return { nominal: m[1], tolLow: m[3], tolHigh: m[2].replace(/^\+/, "") };
+      return { nominal: m[1], tolLow: m[3], tolHigh: m[2].replace(/^\+/, ""), toleranceType: "" };
     }
 
     m = s.match(/^([+-]?\d+\.?\d*)\s*\+\s*(\d+\.?\d*)\s*\/\s*-?\s*(\d+\.?\d*)/);
     if (m) {
-      return { nominal: m[1], tolLow: "-" + m[3], tolHigh: m[2] };
+      return { nominal: m[1], tolLow: m[3], tolHigh: m[2], toleranceType: "" };
     }
 
     m = s.match(/^([+-]?\d+\.?\d*)\s*([+-]\d+\.?\d*)\s+([+-]\d+\.?\d*)/);
     if (m) {
-      return { nominal: m[1], tolLow: m[3], tolHigh: m[2].replace(/^\+/, "") };
+      return { nominal: m[1], tolLow: m[3], tolHigh: m[2].replace(/^\+/, ""), toleranceType: "" };
     }
 
     m = s.match(/^([+-]?\d+\.?\d*)\s*$/);
-    if (m) return { nominal: m[1], tolLow: "", tolHigh: "" };
+    if (m) return attachQuantity({ nominal: m[1], tolLow: "", tolHigh: "", toleranceType: "" }, qty);
 
     m = s.match(/([+-]?\d+\.?\d*)/);
-    if (m) return { nominal: m[1], tolLow: "", tolHigh: "" };
+    if (m) return attachQuantity({ nominal: m[1], tolLow: "", tolHigh: "", toleranceType: "" }, qty);
 
-    return { nominal: text, tolLow: "", tolHigh: "" };
+    if (isDrawingMetadataValue(s)) {
+      return attachQuantity({ nominal: s, tolLow: "", tolHigh: "", toleranceType: "Metadata" }, qty);
+    }
+
+    return attachQuantity({ nominal: text, tolLow: "", tolHigh: "", toleranceType: "" }, qty);
   }
 
   function buildDetectedText(nominal, tolerance) {
@@ -55,25 +160,38 @@
     const others = it.others != null ? String(it.others).trim() : "";
 
     if (!nom && !tol) {
-      const src = others || (it.detected_text || "").trim();
+      const src = [others, it.raw_ocr, it.detected_text]
+        .map(function (p) {
+          return normalizeEuropeanDecimal(p);
+        })
+        .filter(Boolean)
+        .join(" ")
+        .trim();
       if (src) {
         const p = parseDetectedText(src);
         nom = p.nominal || "";
+        if (p.toleranceType) it.tolerance_type = p.toleranceType;
+        if (p.toleranceType === "Surface Finish") it.feature_type = "Surface Finish";
+        if (p.quantityNotation) {
+          it.quantity_notation = p.quantityNotation;
+          it.others = p.quantityNotation;
+        }
         if (p.tolLow !== "" || p.tolHigh !== "") {
           const lo = parseFloat(p.tolLow);
           const hi = parseFloat(p.tolHigh);
           if (Number.isFinite(lo) && Number.isFinite(hi) && Math.abs(lo + hi) < 1e-6) {
             tol = "±" + String(hi).replace(/^\+/, "");
-          } else if (p.tolHigh) {
-            tol = "+" + p.tolHigh + (p.tolLow ? "/" + p.tolLow : "");
+          } else if (p.tolHigh !== "" || p.tolLow !== "") {
+            tol = "+" + String(p.tolHigh).replace(/^\+/, "") + "/" + String(p.tolLow).replace(/^\+/, "");
           }
         }
       }
     }
 
-    it.nominal_value = nom;
-    it.tolerance = tol;
+    it.nominal_value = normalizeEuropeanDecimal(nom);
+    it.tolerance = normalizeEuropeanDecimal(tol);
     it.detected_text = buildDetectedText(nom, tol);
+    applyClassAwareParseHints(it, parseDetectedText(buildDetectedText(nom, tol)));
     return it;
   }
 
@@ -83,6 +201,163 @@
     const tol = (it.tolerance || "").trim();
     if (nom || tol) return parseDetectedText(buildDetectedText(nom, tol));
     return parseDetectedText(it.detected_text || "");
+  }
+
+  function isRejectedLabel(text) {
+    var t = String(text || "").replace(/\s+/g, " ").trim();
+    if (!t) return false;
+    if (/^[XxYyZz]$/.test(t)) return true;
+    if (/^SECTION\s*[A-Z0-9]*$/i.test(t)) return true;
+    if (/^DETAIL\s*[A-Z0-9]*$/i.test(t)) return true;
+    if (/^VIEW\s/i.test(t)) return true;
+    return false;
+  }
+
+  function isSymbolAlphanumericValue(text) {
+    var t = String(text || "").replace(/\s+/g, " ").trim();
+    if (!t) return false;
+    if (/^R[azt]\s*\d/i.test(t)) return true;
+    if (/^a\s+\d+\.?\d*$/i.test(t)) return true;
+    if (/^\(\s*\d+\.?\d*\s*\)$/.test(t)) return true;
+    if (/^\d+\.?\d*$/.test(t)) return true;
+    return false;
+  }
+
+  function applyClassAwareParseHints(it, parsed) {
+    if (!it) return it;
+    var cls = String(it.class_name || "").toLowerCase();
+    var nom = String(it.nominal_value || "").trim();
+    if (/surface/.test(cls) && /^a\s+\d/i.test(nom)) {
+      it.nominal_value = nom.replace(/^a\s+/i, "Ra ");
+      it.feature_type = it.feature_type || "Surface Finish";
+    }
+    if (/weld/.test(cls)) {
+      it.feature_type = it.feature_type || "Weld";
+      var weld = extractWeldThroat(balloonItemText(it));
+      if (weld) it.nominal_value = weld;
+    }
+    if (/gdt|gd/.test(cls)) {
+      it.feature_type = it.feature_type || "GD&T";
+    }
+    if (/special|characteristic/.test(cls) && /^\d+\.?\d*$/.test(nom)) {
+      it.tolerance_type = "Basic";
+    }
+    if (parsed && parsed.toleranceType) it.tolerance_type = parsed.toleranceType;
+    if (parsed && parsed.toleranceType === "Surface Finish") it.feature_type = "Surface Finish";
+    return it;
+  }
+
+  /**
+   * Valid for drawing + inspection report: must have nominal (with digit for dimensions)
+   * or readable note/GD&T/weld text. Crop image alone is not enough.
+   */
+  function balloonHasExtractedData(it) {
+    if (!it) return false;
+    enrichBalloonItem(it);
+    var cls = String(it.class_name || "").toLowerCase();
+    var nom = String(it.nominal_value != null ? it.nominal_value : "").trim();
+    var tol = String(it.tolerance != null ? it.tolerance : "").trim();
+    var lo = String(it.tol_low != null ? it.tol_low : "").trim();
+    var hi = String(it.tol_high != null ? it.tol_high : "").trim();
+    if (!lo && !hi && tol) {
+      var parsed = parseDetectedText(buildDetectedText(nom, tol));
+      lo = parsed.tolLow || "";
+      hi = parsed.tolHigh || "";
+    }
+    var blob = balloonItemText(it);
+    if (isRejectedLabel(nom) || isRejectedLabel(tol) || isRejectedLabel(blob)) return false;
+    if (/note|title|revision|miscellaneous/.test(cls)) {
+      if (isDrawingMetadataValue(nom) || isDrawingMetadataValue(blob)) return true;
+      return blob.length >= 1 && !isRejectedLabel(blob);
+    }
+    if (/^R\d/i.test(nom)) return true;
+    if (/^[ØøΦφ⌀∅]\s*\d/.test(nom)) return true;
+    if (/gdt|gd|datum|weld|surface|special/.test(cls)) {
+      return /[\dA-Za-z°±]/.test(nom + tol + blob);
+    }
+    if (isSymbolAlphanumericValue(nom) || isSymbolAlphanumericValue(blob)) return true;
+    if (/\bR[azt]\s*\d/i.test(nom + blob)) return true;
+    if (/\ba\s+\d/i.test(blob)) return true;
+    if (nom && /\d/.test(nom)) return true;
+    if (/[ØøΦφ⌀∅]/.test(nom) && /\d/.test(nom + tol + blob)) return true;
+    if (lo || hi) return !!(nom || /\d/.test(tol));
+    return false;
+  }
+
+  function findItemForDetectionIndex(det, idx) {
+    var items = (det && det.balloon_items) || [];
+    var i;
+    for (i = 0; i < items.length; i++) {
+      if (detectionIndexForItem(det, items[i]) === idx) return items[i];
+    }
+    return null;
+  }
+
+  function hideIncompleteBalloons(det) {
+    if (!det) return det;
+    ensureDrawingAnnotations(det);
+    var items = det.balloon_items || [];
+    var dets = det.detections || [];
+    var full = det.detections_full || [];
+    var anns = det.drawing_annotations || [];
+    var byDi = {};
+    var i;
+
+    for (i = 0; i < items.length; i++) {
+      enrichBalloonItem(items[i]);
+      var di = detectionIndexForItem(det, items[i]);
+      if (di == null) continue;
+      if (!byDi[di]) byDi[di] = [];
+      byDi[di].push(items[i]);
+    }
+
+    var keep = [];
+    var dropped = 0;
+    for (i = 0; i < dets.length; i++) {
+      var group = byDi[i] || [];
+      var ok = group.some(balloonHasExtractedData);
+      if (ok) keep.push(i);
+      else dropped += 1;
+    }
+
+    if (keep.length === dets.length) {
+      det.balloons_dropped_report = dropped;
+      return det;
+    }
+
+    var remap = {};
+    keep.forEach(function (oldIdx, newIdx) {
+      remap[oldIdx] = newIdx;
+    });
+
+    det.detections = keep.map(function (idx) {
+      return dets[idx];
+    });
+    if (full.length === dets.length) {
+      det.detections_full = keep.map(function (idx) {
+        return full[idx];
+      });
+    }
+    det.drawing_annotations = keep.map(function (idx, newIdx) {
+      var ann = anns[idx] || {};
+      return Object.assign({}, ann, { id: newIdx + 1, canvas_skip: false });
+    });
+
+    var newItems = [];
+    for (i = 0; i < items.length; i++) {
+      if (!balloonHasExtractedData(items[i])) continue;
+      var oldDi = detectionIndexForItem(det, items[i]);
+      if (oldDi == null || remap[oldDi] === undefined) continue;
+      var row = Object.assign({}, enrichBalloonItem(items[i]));
+      row.detection_index = remap[oldDi];
+      row.balloon_number = remap[oldDi] + 1;
+      newItems.push(row);
+    }
+    det.balloon_items = newItems;
+    det.count = det.detections.length;
+    det.balloons_dropped_report = dropped;
+    det.balloons_hidden_no_data = dropped;
+    return det;
   }
 
   function balloonItemText(it) {
@@ -106,7 +381,12 @@
   function parseMultiplierCount(text) {
     const blob = (text || "").trim();
     if (!blob) return 0;
-    const m = blob.match(/(\d+)\s*[xX×]/);
+    let m = blob.match(/\(\s*(\d+)\s*[xX×]\s*\)/);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      return Number.isFinite(n) && n >= 2 ? n : 0;
+    }
+    m = blob.match(/(\d+)\s*[xX×]/);
     if (!m) return 0;
     const n = parseInt(m[1], 10);
     return Number.isFinite(n) && n >= 2 ? n : 0;
@@ -116,9 +396,21 @@
     if (!it) return 0;
     const stored = parseInt(it.multiplier_count, 10);
     if (Number.isFinite(stored) && stored >= 2) return stored;
-    const fromText = parseMultiplierCount(balloonItemText(it));
+    const textFields = [
+      it.others,
+      it.nominal_value,
+      it.tolerance,
+      it.raw_ocr,
+      it.detected_text,
+      it.multiplier_notation,
+    ]
+      .filter(function (p) {
+        return p != null && String(p).trim();
+      })
+      .join(" ");
+    const fromText = parseMultiplierCount(textFields);
     if (fromText >= 2) return fromText;
-    return parseMultiplierCount(it.multiplier_notation || "");
+    return 0;
   }
 
   function isSubBalloonItem(it) {
@@ -138,25 +430,142 @@
     return dot > 0 ? bn.slice(0, dot) : bn;
   }
 
-  /** Whole number for red circle on drawing only (15 not 15.1). Table keeps sub-rows. */
+  /** Whole number for canvas balloon label only (15 not 15.1). Table keeps sub-rows. */
+  /**
+   * Tight balloon: place circle just outside the detection box with a clear leader target.
+   * Returns image-space { ax, ay, px, py } (anchor on box edge, preferred balloon center).
+   */
+  function tightBalloonPlacement(bb, gapPx, orientation, balloonSide) {
+    if (!bb || bb.length < 4) {
+      return { ax: 0, ay: 0, px: 0, py: 0, side: "below" };
+    }
+    const x1 = bb[0];
+    const y1 = bb[1];
+    const x2 = bb[2];
+    const y2 = bb[3];
+    const w = x2 - x1;
+    const h = y2 - y1;
+    const cx = (x1 + x2) / 2;
+    const cy = (y1 + y2) / 2;
+    const gap =
+      gapPx != null ? gapPx : Math.max(16, Math.min(w, h) * 0.18, Math.max(w, h) * 0.08);
+    const ori =
+      orientation ||
+      (h >= w * 1.15 ? "vertical" : w >= h * 1.15 ? "horizontal" : "square");
+    const side = (balloonSide || "").toLowerCase();
+    if (ori === "vertical" || (ori !== "horizontal" && h >= w * 1.15)) {
+      if (side === "left") {
+        return { ax: x1, ay: cy, px: x1 - gap, py: cy, side: "left" };
+      }
+      return { ax: x2, ay: cy, px: x2 + gap, py: cy, side: "right" };
+    }
+    if (ori === "horizontal" || w >= h * 1.15) {
+      if (side === "above") {
+        return { ax: cx, ay: y1, px: cx, py: y1 - gap, side: "above" };
+      }
+      return { ax: cx, ay: y2, px: cx, py: y2 + gap, side: "below" };
+    }
+    return { ax: cx, ay: y2, px: cx, py: y2 + gap, side: "below" };
+  }
+
+  function tightTextPosForBbox(bb) {
+    const t = tightBalloonPlacement(bb, null);
+    return [t.px, t.py];
+  }
+
+  function wholeBalloonNumber(bn) {
+    const s = String(bn != null ? bn : "").trim();
+    if (!s) return "";
+    const m = s.match(/^(\d+)\.\d+$/);
+    return m ? m[1] : s;
+  }
+
   function drawingCanvasLabel(ann) {
     if (!ann) return "";
     if (ann.display_id != null && String(ann.display_id).trim() !== "") {
-      const d = String(ann.display_id);
-      const dm = d.match(/^(\d+)\.\d+$/);
-      return dm ? dm[1] : d;
+      return wholeBalloonNumber(ann.display_id);
     }
     if (ann.parent_balloon_number != null && String(ann.parent_balloon_number).trim() !== "") {
       return String(ann.parent_balloon_number);
     }
-    const id = String(ann.id != null ? ann.id : "");
-    const m = id.match(/^(\d+)\.\d+$/);
-    return m ? m[1] : id;
+    return wholeBalloonNumber(ann.id != null ? ann.id : "");
+  }
+
+  /** Canvas label must match Detected details balloon_number for the same detection_index. */
+  function canvasLabelForDetection(det, di) {
+    const items = (det && det.balloon_items) || [];
+    let parentLabel = "";
+    let subParent = "";
+    for (let j = 0; j < items.length; j++) {
+      const it = items[j];
+      if (detectionIndexForItem(det, it) !== di) continue;
+      if (isSubBalloonItem(it)) {
+        if (!subParent) subParent = String(parentBalloonNumber(it) || "");
+      } else {
+        parentLabel = wholeBalloonNumber(it.balloon_number);
+      }
+    }
+    if (parentLabel) return parentLabel;
+    if (subParent) return subParent;
+    const ann = (det.drawing_annotations || [])[di];
+    const fromAnn = drawingCanvasLabel(ann);
+    if (fromAnn) return fromAnn;
+    return String(di + 1);
+  }
+
+  function findBalloonItem(det, it) {
+    if (!det || !it) return null;
+    const bn = String(it.balloon_number != null ? it.balloon_number : "");
+    const items = det.balloon_items || [];
+    for (let i = 0; i < items.length; i++) {
+      if (String(items[i].balloon_number) === bn) return items[i];
+    }
+    return null;
+  }
+
+  /**
+   * One canvas balloon per visible detection, keyed by detection_index (same as Detected details).
+   */
+  function detectionEntriesForCanvas(det) {
+    if (!det) return [];
+    ensureDrawingAnnotations(det);
+    const dets = det.detections || [];
+    const anns = det.drawing_annotations || [];
+    const out = [];
+    for (let i = 0; i < dets.length; i++) {
+      const ann = anns[i] || {};
+      if (ann.canvas_skip || ann.report_only || ann.is_parent_balloon) continue;
+      const rowItem = findItemForDetectionIndex(det, i);
+      if (rowItem && !balloonHasExtractedData(rowItem)) continue;
+      const d = dets[i] || {};
+      const bb =
+        d.bbox && d.bbox.length >= 4
+          ? d.bbox.slice()
+          : ann.BBox && ann.BBox.length >= 4
+            ? ann.BBox.slice()
+            : null;
+      if (!bb) continue;
+      out.push({
+        detectionIndex: i,
+        bbox: bb,
+        label: canvasLabelForDetection(det, i),
+        ann: ann,
+        dimension_orientation: d.dimension_orientation || ann.dimension_orientation,
+        balloon_side: d.balloon_side || ann.balloon_side,
+      });
+    }
+    return out;
   }
 
   function annotationsForCanvas(det) {
-    return (det.drawing_annotations || []).filter(function (a) {
-      return a && !a.draw_suppress && !a.canvas_skip && !a.report_only && !a.is_parent_balloon;
+    var dets = det.detections || [];
+    var anns = det.drawing_annotations || [];
+    if (dets.length && anns.length !== dets.length && ensureDrawingAnnotations) {
+      ensureDrawingAnnotations(det);
+      anns = det.drawing_annotations || [];
+    }
+    return anns.filter(function (a) {
+      return a && !a.canvas_skip && !a.report_only && !a.is_parent_balloon;
     });
   }
 
@@ -275,19 +684,10 @@
     return Math.hypot(pcx - tcx, pcy - tcy) < span * 2.5;
   }
 
-  /** Looser match for extra YOLO boxes on the same nX callout (text + leader line). */
+  /** Hide only duplicate YOLO slot on same nX callout (heavy overlap), not nearby dimensions. */
   function bboxNearMultiplierDuplicate(primaryBb, thisBb) {
     if (!primaryBb || !thisBb || primaryBb.length < 4 || thisBb.length < 4) return false;
-    if (bboxOverlap(primaryBb, thisBb) >= 0.08) return true;
-    if (bboxNearDuplicate(primaryBb, thisBb)) return true;
-    const pcx = (primaryBb[0] + primaryBb[2]) / 2;
-    const pcy = (primaryBb[1] + primaryBb[3]) / 2;
-    const tcx = (thisBb[0] + thisBb[2]) / 2;
-    const tcy = (thisBb[1] + thisBb[3]) / 2;
-    const w = Math.max(primaryBb[2] - primaryBb[0], thisBb[2] - thisBb[0], 60);
-    const h = Math.max(primaryBb[3] - primaryBb[1], thisBb[3] - thisBb[1], 20);
-    if (Math.abs(pcy - tcy) > h * 2.5) return false;
-    return Math.abs(pcx - tcx) < w * 3.5;
+    return bboxOverlap(primaryBb, thisBb) >= 0.72;
   }
 
   function detectionIndexForItem(det, it) {
@@ -437,7 +837,7 @@
         id: i + 1,
         AnnotationType: (d && d.class_name) || "Dimensions",
         BBox: bb.length >= 4 ? bb.slice() : [],
-        TextPos: bb.length >= 4 ? [(bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2] : [],
+        TextPos: bb.length >= 4 ? tightTextPosForBbox(bb) : [],
       };
     });
     det.drawing_annotations = anns;
@@ -448,9 +848,8 @@
     if (!det) return det;
     ensureDrawingAnnotations(det);
     const dets = det.detections || [];
-    const anns = det.drawing_annotations || [];
     const items = det.balloon_items || [];
-    if (!dets.length || !anns.length) return det;
+    if (!dets.length) return det;
 
     const primaryDetByParent = {};
     items.forEach(function (it) {
@@ -463,45 +862,57 @@
       }
     });
 
-    const hasSubs = Object.keys(primaryDetByParent).length > 0;
-
-    for (let i = 0; i < anns.length; i++) {
-      const ann = anns[i];
-      if (!ann) continue;
+    const newAnns = [];
+    const preserveLegacyPos = det.balloon_placement === "legacy";
+    for (let i = 0; i < dets.length; i++) {
+      const d = dets[i];
+      const bb = (d && d.bbox) || [];
+      const old = (det.drawing_annotations || [])[i] || {};
+      const ann = Object.assign({}, old);
       delete ann.draw_suppress;
-      delete ann.canvas_skip;
-      delete ann.display_id;
       delete ann.report_only;
+      delete ann.is_parent_balloon;
 
       let pid = ann.id != null ? ann.id : i + 1;
-      if (hasSubs) {
-        const parentKeys = Object.keys(primaryDetByParent);
-        for (let pi = 0; pi < parentKeys.length; pi++) {
-          const p = parentKeys[pi];
-          const primaryDi = primaryDetByParent[p];
-          if (i === primaryDi) {
-            pid = p;
-            break;
-          }
-          const primaryBb = bboxForBalloonRow(det, primaryDi, itemAtDetectionIndex(det, primaryDi));
-          const thisBb = bboxForBalloonRow(det, i, itemAtDetectionIndex(det, i));
-          if (primaryBb && thisBb && bboxOverlap(primaryBb, thisBb) >= 0.3) {
-            ann.draw_suppress = true;
-            det.drawing_annotations[i] = ann;
-            break;
-          }
+      let canvasSkip = false;
+      const thisBb = bboxForBalloonRow(det, i, itemAtDetectionIndex(det, i));
+      const parentKeys = Object.keys(primaryDetByParent);
+      for (let pi = 0; pi < parentKeys.length; pi++) {
+        const p = parentKeys[pi];
+        const primaryDi = primaryDetByParent[p];
+        if (i === primaryDi) {
+          pid = p;
+          break;
         }
-        if (ann.draw_suppress) continue;
+        const primaryBb = bboxForBalloonRow(det, primaryDi, itemAtDetectionIndex(det, primaryDi));
+        if (primaryBb && thisBb && bboxNearMultiplierDuplicate(primaryBb, thisBb)) {
+          canvasSkip = true;
+          break;
+        }
       }
+
       ann.id = pid;
       ann.display_id = drawingCanvasLabel({ id: pid, display_id: pid });
-      if (ann.BBox && ann.BBox.length >= 4) {
-        const bb = ann.BBox;
-        ann.TextPos = [(bb[0] + bb[2]) / 2, bb[1] - 12];
+      ann.canvas_skip = canvasSkip;
+      if (bb.length >= 4) {
+        ann.AnnotationType = (d && d.class_name) || ann.AnnotationType || "Dimensions";
+        ann.BBox = bb.slice();
+        var keepLegacy = preserveLegacyPos && ann.TextPos && ann.TextPos.length >= 2;
+        if (!keepLegacy) {
+          const pl = tightBalloonPlacement(
+            bb,
+            null,
+            (d && d.dimension_orientation) || ann.dimension_orientation,
+            (d && d.balloon_side) || ann.balloon_side
+          );
+          ann.TextPos = [pl.px, pl.py];
+        }
+        if (d && d.dimension_orientation) ann.dimension_orientation = d.dimension_orientation;
+        if (d && d.balloon_side) ann.balloon_side = d.balloon_side;
       }
-      det.drawing_annotations[i] = ann;
+      newAnns.push(ann);
     }
-    det.drawing_annotations = anns;
+    det.drawing_annotations = newAnns;
     delete det.canvas_balloon_annotations;
     return det;
   }
@@ -510,12 +921,153 @@
    * nX: split balloon_items only (15.1, 15.2 in table).
    * drawing_annotations stay 1:1 with detections — balloon 15 on drawing.
    */
+  /**
+   * Ensure Detected details / Inspection report list every detection balloon number.
+   */
+  function syncBalloonItemsFromDetections(det) {
+    if (!det) return det;
+    const dets = det.detections || [];
+    if (!dets.length) return det;
+    ensureDrawingAnnotations(det);
+    const anns = det.drawing_annotations || [];
+    const items = det.balloon_items || [];
+    const byDi = {};
+
+    items.forEach(function (it) {
+      let di = detectionIndexForItem(det, it);
+      if (di == null) {
+        const parent = parentBalloonNumber(it) || String(it.balloon_number || "");
+        for (let i = 0; i < anns.length; i++) {
+          const lid = String(drawingCanvasLabel(anns[i]) || anns[i].id || "");
+          if (lid === String(parent)) {
+            di = i;
+            break;
+          }
+        }
+      }
+      if (di == null) return;
+      if (!byDi[di]) byDi[di] = [];
+      byDi[di].push(it);
+    });
+
+    const out = [];
+    for (let i = 0; i < dets.length; i++) {
+      const group = byDi[i];
+      if (group && group.length) {
+        group.sort(function (a, b) {
+          const sa = isSubBalloonItem(a);
+          const sb = isSubBalloonItem(b);
+          if (sa !== sb) return sa ? 1 : -1;
+          return String(a.balloon_number).localeCompare(String(b.balloon_number), undefined, {
+            numeric: true,
+          });
+        });
+        group.forEach(function (it) {
+          const row = Object.assign({}, it);
+          row.detection_index = i;
+          const db = (dets[i] || {}).bbox;
+          if (db && db.length >= 4) row.bbox_pixels = db.slice();
+          if (!isSubBalloonItem(row)) {
+            const lid = canvasLabelForDetection(det, i);
+            if (lid) row.balloon_number = lid;
+          }
+          enrichBalloonItem(row);
+          out.push(row);
+        });
+        continue;
+      }
+      const d = dets[i] || {};
+      const ann = anns[i] || {};
+      const bn = drawingCanvasLabel(ann) || String(ann.id != null ? ann.id : i + 1);
+      const bb = d.bbox && d.bbox.length >= 4 ? d.bbox.slice() : [];
+      out.push(
+        enrichBalloonItem({
+          balloon_number: bn,
+          detection_index: i,
+          class_name: d.class_name || "",
+          confidence: d.confidence != null ? d.confidence : "",
+          nominal_value: "",
+          tolerance: "",
+          others: "",
+          detected_text: "",
+          bbox_pixels: bb,
+        })
+      );
+    }
+    det.balloon_items = out;
+    return det;
+  }
+
+  /** Detection indices that have a visible balloon on the drawing canvas. */
+  function visibleDetectionIndexSet(det) {
+    const set = {};
+    detectionEntriesForCanvas(det).forEach(function (e) {
+      if (e.detectionIndex != null) set[e.detectionIndex] = true;
+    });
+    return set;
+  }
+
+  /** Top→bottom, then left→right (same as server tblr reorder). */
+  function sortBalloonItemsTblr(items) {
+    return (items || []).slice().sort(function (a, b) {
+      const bbA = a.bbox_pixels || [];
+      const bbB = b.bbox_pixels || [];
+      if (bbA.length >= 4 && bbB.length >= 4) {
+        const yA = Number(bbA[1]);
+        const yB = Number(bbB[1]);
+        if (yA !== yB) return yA - yB;
+        return Number(bbA[0]) - Number(bbB[0]);
+      }
+      const na = parseInt(a.balloon_number, 10);
+      const nb = parseInt(b.balloon_number, 10);
+      if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb;
+      return String(a.balloon_number || "").localeCompare(String(b.balloon_number || ""), undefined, {
+        numeric: true,
+      });
+    });
+  }
+
+  /** Table + confirm UI: one row per visible balloon (not every raw YOLO detection). */
+  function itemsForTable(det) {
+    if (!det) return [];
+    const dets = det.detections || [];
+    if (!dets.length && det.balloon_items && det.balloon_items.length) {
+      return sortBalloonItemsTblr(
+        (det.balloon_items || []).filter(function (it) {
+          return (
+            !isSubBalloonItem(it) && !it.is_parent_balloon && balloonHasExtractedData(it)
+          );
+        })
+      );
+    }
+    syncBalloonItemsFromDetections(det);
+    const vis = visibleDetectionIndexSet(det);
+    return sortBalloonItemsTblr(
+      (det.balloon_items || []).filter(function (it) {
+        if (isSubBalloonItem(it) || it.is_parent_balloon) return false;
+        const di = detectionIndexForItem(det, it);
+        return di != null && vis[di];
+      })
+    );
+  }
+
+  function visibleBalloonCount(det) {
+    return detectionEntriesForCanvas(det).length;
+  }
+
+  /** Inspection report: visible balloons with extracted data (no confirm step). */
+  function itemsForDisplay(det) {
+    return itemsForTable(det).filter(function (it) {
+      return balloonHasExtractedData(it);
+    });
+  }
+
   function expandMultiplierBalloons(det) {
     if (!det || !det.balloon_items || !det.balloon_items.length) return det;
     if (isAlreadyMultiplierExpanded(det)) {
       pruneParentBalloonsWithSubs(det);
-      pruneOverlappingDuplicateDetections(det);
-      return repairMultiplierDrawingAnnotations(det);
+      repairMultiplierDrawingAnnotations(det);
+      return syncBalloonItemsFromDetections(det);
     }
     stripSubBalloons(det);
 
@@ -559,8 +1111,8 @@
 
     det.balloon_items = newItems;
     pruneParentBalloonsWithSubs(det);
-    pruneOverlappingDuplicateDetections(det);
-    return repairMultiplierDrawingAnnotations(det);
+    repairMultiplierDrawingAnnotations(det);
+    return syncBalloonItemsFromDetections(det);
   }
 
   function syncBalloonItemsFromDetectionIds(det, detIndexToNewId) {
@@ -589,9 +1141,12 @@
       existing = InspectionStore.getMeta() || {};
     }
     const meta = {
+      drawingNumber: tb.drawing_number || tb.drawingNumber || existing.drawingNumber || "",
       partNumber: tb.part_number || tb.partNumber || existing.partNumber || "",
       partName: tb.part_name || tb.partName || existing.partName || "",
       revision: tb.revision || existing.revision || "",
+      changeNumber: tb.change_number || tb.changeNumber || existing.changeNumber || "",
+      date: tb.date || existing.date || "",
       material: tb.material || existing.material || "",
       mass: tb.mass || existing.mass || "",
       finish: tb.finish_treatment || tb.finish || existing.finish || "",
@@ -604,10 +1159,95 @@
     }
   }
 
+  /** YOLO class → box colors on the ballooning canvas (stroke + translucent fill). */
+  var DETECTION_CLASS_COLORS = {
+    Dimensions: {
+      label: "Dimensions",
+      stroke: "#0891b2",
+      fill: "rgba(8, 145, 178, 0.22)",
+    },
+    GDnT: {
+      label: "GD&T",
+      stroke: "#c026d3",
+      fill: "rgba(192, 38, 211, 0.18)",
+    },
+    Notes: {
+      label: "Notes",
+      stroke: "#ca8a04",
+      fill: "rgba(202, 138, 4, 0.18)",
+    },
+    Surface_Finish_Symbols: {
+      label: "Surface finish",
+      stroke: "#059669",
+      fill: "rgba(5, 150, 105, 0.18)",
+    },
+    Special_Characteristics: {
+      label: "Special characteristic",
+      stroke: "#dc2626",
+      fill: "rgba(220, 38, 38, 0.16)",
+    },
+    _default: {
+      label: "Other",
+      stroke: "#6366f1",
+      fill: "rgba(99, 102, 241, 0.16)",
+    },
+  };
+
+  function normalizeDetectionClass(cls) {
+    const s = String(cls || "").trim();
+    if (!s) return "Dimensions";
+    if (/^dimension/i.test(s)) return "Dimensions";
+    if (/^gdt$/i.test(s) || /^gd&?t$/i.test(s) || /^gdn?t$/i.test(s)) return "GDnT";
+    if (/^note/i.test(s)) return "Notes";
+    if (/surface/i.test(s) && /finish/i.test(s)) return "Surface_Finish_Symbols";
+    if (/special/i.test(s) && /char/i.test(s)) return "Special_Characteristics";
+    if (DETECTION_CLASS_COLORS[s]) return s;
+    return s;
+  }
+
+  function detectionClassPalette(cls) {
+    const key = normalizeDetectionClass(cls);
+    return DETECTION_CLASS_COLORS[key] || DETECTION_CLASS_COLORS._default;
+  }
+
+  /** Human-readable label for canvas/table (never DIM/GDT abbreviations). */
+  function formatDetectionClassLabel(cls) {
+    const raw = String(cls || "").trim();
+    const pal = detectionClassPalette(raw);
+    if (pal && pal.label && pal.label !== "Other") {
+      return pal.label;
+    }
+    if (raw) {
+      return raw.replace(/_/g, " ");
+    }
+    return "Dimensions";
+  }
+
+  function detectionClassLegendList() {
+    return [
+      "Dimensions",
+      "GDnT",
+      "Notes",
+      "Surface_Finish_Symbols",
+      "Special_Characteristics",
+    ].map(function (key) {
+      const p = DETECTION_CLASS_COLORS[key];
+      return { key: key, label: p.label, stroke: p.stroke, fill: p.fill };
+    });
+  }
+
   global.BalloonParse = {
+    DETECTION_CLASS_COLORS: DETECTION_CLASS_COLORS,
+    normalizeDetectionClass: normalizeDetectionClass,
+    detectionClassPalette: detectionClassPalette,
+    formatDetectionClassLabel: formatDetectionClassLabel,
+    detectionClassLegendList: detectionClassLegendList,
     parseDetectedText: parseDetectedText,
     parseBalloonItem: parseBalloonItem,
     enrichBalloonItem: enrichBalloonItem,
+    balloonHasExtractedData: balloonHasExtractedData,
+    hideIncompleteBalloons: hideIncompleteBalloons,
+    findItemForDetectionIndex: findItemForDetectionIndex,
     buildDetectedText: buildDetectedText,
     parseMultiplierCount: parseMultiplierCount,
     expandMultiplierBalloons: expandMultiplierBalloons,
@@ -615,10 +1255,22 @@
     pruneParentBalloonsWithSubs: pruneParentBalloonsWithSubs,
     ensureDrawingAnnotations: ensureDrawingAnnotations,
     drawingCanvasLabel: drawingCanvasLabel,
+    wholeBalloonNumber: wholeBalloonNumber,
+    canvasLabelForDetection: canvasLabelForDetection,
+    detectionEntriesForCanvas: detectionEntriesForCanvas,
+    findBalloonItem: findBalloonItem,
+    tightBalloonPlacement: tightBalloonPlacement,
+    tightTextPosForBbox: tightTextPosForBbox,
     annotationsForCanvas: annotationsForCanvas,
     repairMultiplierDrawingAnnotations: repairMultiplierDrawingAnnotations,
     syncBalloonItemsFromDetectionIds: syncBalloonItemsFromDetectionIds,
     isAlreadyMultiplierExpanded: isAlreadyMultiplierExpanded,
     saveInspectionMetaFromDetection: saveInspectionMetaFromDetection,
+    syncBalloonItemsFromDetections: syncBalloonItemsFromDetections,
+    itemsForTable: itemsForTable,
+    itemsForDisplay: itemsForDisplay,
+    sortBalloonItemsTblr: sortBalloonItemsTblr,
+    visibleBalloonCount: visibleBalloonCount,
+    visibleDetectionIndexSet: visibleDetectionIndexSet,
   };
 })(typeof window !== "undefined" ? window : globalThis);
